@@ -18,6 +18,7 @@ use api::area::{AreaEvent, AreaRequest};
 use api::client::{BiliClient, LIVE_BASE};
 use api::danmaku::DanmuMsg;
 use api::info::{InfoEvent, InfoRequest};
+use api::live::{LiveAction, LiveEvent, LiveRequest};
 use api::login::{LoginCtx, LoginEvent, PASSPORT_BASE, POLL_ATTEMPTS, POLL_GAP};
 
 #[tokio::main]
@@ -60,6 +61,11 @@ async fn main() -> Result<()> {
     // 事件容量开 4：里面可能带着一整张封面图（几 MB），别让队列把内存吃掉一半。
     let (info_tx, info_rx) = mpsc::channel::<InfoRequest>(4);
     let (info_evt_tx, info_evt_rx) = mpsc::channel::<InfoEvent>(4);
+    // 开播那条链：界面 -> 开播任务（查状态 / 开播 / 下播），开播任务 -> 界面。
+    // 容量 4：开播和下播只有确认那一下会发，正常按不出「忙」；
+    // 事件容量给小一点 —— 里面装着推流凭据（几百字节），用不着排队。
+    let (live_tx, live_rx) = mpsc::channel::<LiveRequest>(4);
+    let (live_evt_tx, live_evt_rx) = mpsc::channel::<LiveEvent>(8);
     // 登录任务 -> 会话任务：拼好的 Cookie 串。
     let (creds_tx, creds_rx) = mpsc::channel::<String>(1);
     // 「凭据换过了」的信号。watch 里那个数本身没用，变一下就是信号 ——
@@ -99,6 +105,14 @@ async fn main() -> Result<()> {
         refresh_tx.clone(),
         info_rx,
         info_evt_tx,
+    ));
+    tokio::spawn(live_task(
+        client.clone(),
+        LIVE_BASE.to_string(),
+        cfg.room_id,
+        refresh_tx.clone(),
+        live_rx,
+        live_evt_tx,
     ));
 
     if cfg.room_id > 0 {
@@ -146,6 +160,8 @@ async fn main() -> Result<()> {
             area_events: area_evt_rx,
             info: info_tx,
             info_events: info_evt_rx,
+            live: live_tx,
+            live_events: live_evt_rx,
         },
     )
     .await
@@ -289,6 +305,121 @@ async fn info_task(
             }
         }
     }
+}
+
+/// 开播那条链：查开播状态（只读）、开播、下播。
+///
+/// 三件事都从一条 `mpsc<LiveRequest>` 进来，理由跟 `area_task` / `info_task` 一样：
+/// 界面不许自己发请求。不同的是**开播会改账号状态**（直播间立刻对外可见、给粉丝推推送），
+/// 所以那一下只能由用户按 F4、走完确认层之后才发得出来。
+///
+/// 写操作（开播 / 下播）用的房间号必须是 `get_info` 回的**规范号**：配置里那个可能是短号，
+/// 短号也查得到，但写操作拿规范号更稳（上一轮已经证实这俩不是一个数）。
+async fn live_task(
+    client: Arc<BiliClient>,
+    base: String,
+    room_id: i64,
+    refresh: mpsc::Sender<()>,
+    mut req: mpsc::Receiver<LiveRequest>,
+    evt: mpsc::Sender<LiveEvent>,
+) {
+    // 一旦 `get_info` 回过规范号就用它，别再用配置里那个短号。
+    let mut canonical = room_id;
+
+    while let Some(r) = req.recv().await {
+        let out = match r {
+            LiveRequest::LoadStatus => match canonical_room(&client, &base, canonical).await {
+                Ok((id, info)) => {
+                    canonical = id;
+                    LiveEvent::Status {
+                        live_status: info.live_status,
+                    }
+                }
+                Err(e) => LiveEvent::Failed {
+                    action: LiveAction::Status,
+                    message: e.to_string(),
+                },
+            },
+            LiveRequest::Start { area_v2 } => {
+                // 开播之前先把规范房间号拿到手：`startLive` 是写操作，拿短号只会白挨一次错。
+                match canonical_room(&client, &base, canonical).await {
+                    Ok((id, _)) => canonical = id,
+                    Err(e) => {
+                        let out = LiveEvent::Failed {
+                            action: LiveAction::Start,
+                            message: e.to_string(),
+                        };
+                        if evt.send(out).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                match api::live::start_live(&client, &base, canonical, area_v2).await {
+                    Ok(api::live::StartOutcome::Started(streams)) => {
+                        // 主页那格「obs 推流状态」也走这条只读链，顺手让它重拉一次，
+                        // 别让人对着一句「未开播」等满 30 秒。
+                        api::room::refresh(&refresh);
+                        LiveEvent::Started(streams)
+                    }
+                    Ok(api::live::StartOutcome::Verify { kind, url, message }) => {
+                        LiveEvent::Verify { kind, url, message }
+                    }
+                    Err(e) => LiveEvent::Failed {
+                        action: LiveAction::Start,
+                        message: e.to_string(),
+                    },
+                }
+            }
+            LiveRequest::Stop => {
+                // 下播也是写操作，同样得用规范号。**不能**拿配置里那个短号发出去
+                // ——哪怕用户一进来就直接按 F5（那时手上还没有 get_info 的结果）。
+                match canonical_room(&client, &base, canonical).await {
+                    Ok((id, _)) => canonical = id,
+                    Err(e) => {
+                        let out = LiveEvent::Failed {
+                            action: LiveAction::Stop,
+                            message: e.to_string(),
+                        };
+                        if evt.send(out).await.is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                match api::live::stop_live(&client, &base, canonical).await {
+                    Ok(()) => {
+                        api::room::refresh(&refresh);
+                        LiveEvent::Stopped
+                    }
+                    Err(e) => LiveEvent::Failed {
+                        action: LiveAction::Stop,
+                        message: e.to_string(),
+                    },
+                }
+            }
+        };
+        if evt.send(out).await.is_err() {
+            return; // 界面没了
+        }
+    }
+}
+
+/// 拿写操作要用的**规范房间号**，顺手把 `get_info` 一起查了。
+///
+/// 房间号是启动时读进内存的，写操作要用服务端自己认的那一个（配置里可能是短号）。
+/// 房间号是 0 时一个请求都不发 —— 直接说清楚该改哪儿。
+async fn canonical_room(
+    client: &BiliClient,
+    base: &str,
+    room_id: i64,
+) -> anyhow::Result<(i64, api::room::RoomInfo)> {
+    if room_id <= 0 {
+        anyhow::bail!("还没设置直播间号（config.toml 里的 room_id）");
+    }
+    let info = api::room::fetch_room_info(client, base, room_id).await?;
+    let id = if info.room_id > 0 { info.room_id } else { room_id };
+    Ok((id, info))
 }
 
 /// 顺手把封面图抓回来给预览用。
@@ -765,5 +896,222 @@ mod tests {
 
         task.abort();
         let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    // ------------------------------------------------------- 开播那条链
+
+    /// 拉起开播那条链，返回（请求发送端、事件接收端、那条「重刷房间信息」的信号）。
+    fn spawn_live_task(
+        base: &str,
+        room_id: i64,
+    ) -> (
+        mpsc::Sender<LiveRequest>,
+        mpsc::Receiver<LiveEvent>,
+        mpsc::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        // nav 也顶到假服务器：人脸认证那条路要拿 mid 拼地址
+        //（这是唯一会顺手问 nav 的地方，不然单测会打真网络）。
+        let client = Arc::new(
+            BiliClient::new("SESSDATA=abc; bili_jct=tok")
+                .unwrap()
+                .with_main_base(base),
+        );
+        let (tx, rx) = mpsc::channel::<LiveRequest>(4);
+        let (evt_tx, evt_rx) = mpsc::channel::<LiveEvent>(8);
+        let (refresh_tx, refresh_rx) = mpsc::channel::<()>(1);
+        let task = tokio::spawn(live_task(
+            client,
+            base.to_string(),
+            room_id,
+            refresh_tx,
+            rx,
+            evt_tx,
+        ));
+        (tx, evt_rx, refresh_rx, task)
+    }
+
+    /// 开播整条打一遍：先 `get_info` 拿规范房间号，再版本号，再 startLive。
+    /// 配置里写的是短号（`6`），**发出去的那个 room_id 必须是规范号**（`7734200`）。
+    #[tokio::test]
+    async fn live_task_starts_with_the_canonical_room_id() {
+        let srv = test_http::start(|r: &Request| match r.path.as_str() {
+            "/room/v1/Room/get_info" => (
+                200,
+                r#"{"code":0,"message":"0","data":{"room_id":7734200,"uid":42,
+                    "title":"随便播播","live_status":0,"live_time":"0000-00-00 00:00:00",
+                    "user_cover":""}}"#
+                    .to_string(),
+            ),
+            api::live::LIVE_VERSION_PATH => (
+                200,
+                r#"{"code":0,"message":"0","data":{"curr_version":"9.9.9","build":12345}}"#
+                    .to_string(),
+            ),
+            api::live::START_LIVE_PATH => (
+                200,
+                r#"{"code":0,"message":"0","data":{
+                    "rtmp":{"addr":"rtmp://a/live","code":"?s=1"},
+                    "protocols":[{"protocol":"srt","addr":"srt://b:1935","code":"?s=2"}]}}"#
+                    .to_string(),
+            ),
+            other => (
+                200,
+                format!(r#"{{"code":-1,"message":"不认识的路径 {other}"}}"#),
+            ),
+        })
+        .await;
+
+        let (tx, mut rx, mut refresh, task) = spawn_live_task(&srv.base, 6);
+        tx.send(LiveRequest::Start { area_v2: 371 }).await.unwrap();
+        let ev = rx.recv().await.unwrap();
+        let LiveEvent::Started(streams) = ev else {
+            panic!("该是开播成功：{ev:?}");
+        };
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].full_url, "rtmp://a/live?s=1");
+        assert_eq!(streams[1].kind, "srt-1");
+
+        let paths: Vec<String> = srv.hits().iter().map(|r| r.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/room/v1/Room/get_info",
+                api::live::LIVE_VERSION_PATH,
+                api::live::START_LIVE_PATH
+            ],
+            "先拿规范房间号，再版本号，再开播"
+        );
+        let f = form_of(&srv.hits()[2].body);
+        assert_eq!(
+            f.get("room_id").map(String::as_str),
+            Some("7734200"),
+            "配置里是短号 6，写操作要用 get_info 回的规范号"
+        );
+        assert_eq!(f.get("area_v2").map(String::as_str), Some("371"));
+        assert!(f.contains_key("sign"), "开播要带 app 签名：{f:?}");
+        assert!(
+            refresh.try_recv().is_ok(),
+            "开播成功顺手让房间信息那条只读链重拉一次"
+        );
+        task.abort();
+    }
+
+    /// 下播：同样是写操作，同样要规范号（用户可能一进来就按 F5，那时手上还没有
+    /// `get_info` 的结果），而且**不带 app 签名**。
+    #[tokio::test]
+    async fn live_task_stops_with_the_canonical_room_id_and_no_signature() {
+        let srv = test_http::start(|r: &Request| match r.path.as_str() {
+            "/room/v1/Room/get_info" => (
+                200,
+                r#"{"code":0,"message":"0","data":{"room_id":7734200,"uid":42,
+                    "title":"t","live_status":1,"live_time":"2026-10-03 00:00:00",
+                    "user_cover":""}}"#
+                    .to_string(),
+            ),
+            api::live::STOP_LIVE_PATH => (
+                200,
+                r#"{"code":0,"message":"0","data":{}}"#.to_string(),
+            ),
+            other => (
+                200,
+                format!(r#"{{"code":-1,"message":"不认识的路径 {other}"}}"#),
+            ),
+        })
+        .await;
+
+        let (tx, mut rx, mut refresh, task) = spawn_live_task(&srv.base, 6);
+        tx.send(LiveRequest::Stop).await.unwrap();
+        assert_eq!(rx.recv().await.unwrap(), LiveEvent::Stopped);
+
+        let hits = srv.hits();
+        assert_eq!(hits[0].path, "/room/v1/Room/get_info");
+        assert_eq!(hits[1].path, api::live::STOP_LIVE_PATH);
+        let f = form_of(&hits[1].body);
+        assert_eq!(
+            f.get("room_id").map(String::as_str),
+            Some("7734200"),
+            "短号 6 要换成规范号"
+        );
+        assert!(!hits[1].body.contains("appkey"), "{}", hits[1].body);
+        assert!(!hits[1].body.contains("sign="), "{}", hits[1].body);
+        assert!(refresh.try_recv().is_ok(), "下播成功也刷一次房间信息");
+        task.abort();
+    }
+
+    /// 只读的状态查询，以及 60024 要扫码那一条：开播任务得把它当成「要验证」，
+    /// 而不是一句「开播失败」。
+    #[tokio::test]
+    async fn live_task_reports_status_and_the_verify_roadblock() {
+        let srv = test_http::start(|r: &Request| match r.path.as_str() {
+            "/room/v1/Room/get_info" => (
+                200,
+                r#"{"code":0,"message":"0","data":{"room_id":7734200,"uid":42,
+                    "title":"t","live_status":0,"live_time":"0000-00-00 00:00:00",
+                    "user_cover":""}}"#
+                    .to_string(),
+            ),
+            api::live::LIVE_VERSION_PATH => (
+                200,
+                r#"{"code":0,"message":"0","data":{"curr_version":"9.9.9","build":12345}}"#
+                    .to_string(),
+            ),
+            api::live::START_LIVE_PATH => (
+                200,
+                r#"{"code":60024,"message":"请扫码验证","data":{"qr":"https://www.bilibili.com/h5/v?t=a"}}"#
+                    .to_string(),
+            ),
+            other => (
+                200,
+                format!(r#"{{"code":-1,"message":"不认识的路径 {other}"}}"#),
+            ),
+        })
+        .await;
+
+        let (tx, mut rx, _refresh, task) = spawn_live_task(&srv.base, 6);
+        tx.send(LiveRequest::LoadStatus).await.unwrap();
+        assert_eq!(
+            rx.recv().await.unwrap(),
+            LiveEvent::Status { live_status: 0 }
+        );
+
+        tx.send(LiveRequest::Start { area_v2: 371 }).await.unwrap();
+        let ev = rx.recv().await.unwrap();
+        let LiveEvent::Verify { kind, url, message } = ev else {
+            panic!("60024 该是「要验证」而不是普通失败：{ev:?}");
+        };
+        assert_eq!(kind, api::live::VerifyKind::Qr);
+        assert_eq!(url, "https://www.bilibili.com/h5/v?t=a");
+        assert!(message.contains("扫码验证"), "{message}");
+        task.abort();
+    }
+
+    /// 房间号是 0（没配）：一个请求都不发，直接在顶栏说清楚该改哪儿。
+    #[tokio::test]
+    async fn live_task_without_a_room_never_hits_the_network() {
+        let srv = test_http::start(|_| (200, r#"{"code":0,"message":"0"}"#.to_string())).await;
+        let (tx, mut rx, _refresh, task) = spawn_live_task(&srv.base, 0);
+
+        tx.send(LiveRequest::LoadStatus).await.unwrap();
+        let LiveEvent::Failed { action, message } = rx.recv().await.unwrap() else {
+            panic!("该是「没查到」");
+        };
+        assert_eq!(action, LiveAction::Status);
+        assert!(message.contains("直播间号"), "{message}");
+
+        // 开播 / 下播也一样：先被房间号拦住
+        tx.send(LiveRequest::Start { area_v2: 371 }).await.unwrap();
+        let LiveEvent::Failed { action, .. } = rx.recv().await.unwrap() else {
+            panic!("该是「没开成」");
+        };
+        assert_eq!(action, LiveAction::Start);
+        tx.send(LiveRequest::Stop).await.unwrap();
+        let LiveEvent::Failed { action, .. } = rx.recv().await.unwrap() else {
+            panic!("该是「没下成」");
+        };
+        assert_eq!(action, LiveAction::Stop);
+
+        assert!(srv.hits().is_empty(), "一个请求都不该发出去");
+        task.abort();
     }
 }

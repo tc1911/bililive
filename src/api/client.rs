@@ -221,6 +221,16 @@ impl BiliClient {
             })
             .collect::<Vec<_>>()
             .join("&");
+        self.post_body(url, &body).await
+    }
+
+    /// POST 一段**已经拼好**的表单体，返回整个响应体（不判 code）。
+    ///
+    /// 开播那两个接口的签名是对着拼好的那一串算的（`api::appsign` 用 Go 的 Encode 口径：
+    /// `~` 不转义、`*` 要转义），交给 `post_form_raw` 再编码一遍签名就对不上了 ——
+    /// 它走的是 `url` crate 的 WHATWG 口径，正好在那两个字符上相反。
+    /// 所以签名那条链必须把最终的串原样送出去。
+    pub async fn post_body(&self, url: &str, body: &str) -> Result<Value> {
         let mut req = self
             .http
             .post(url)
@@ -228,7 +238,7 @@ impl BiliClient {
                 reqwest::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded; charset=UTF-8",
             )
-            .body(body);
+            .body(body.to_string());
         if let Some(cookie) = self.auth.lock().await.header.clone() {
             req = req.header(reqwest::header::COOKIE, cookie);
         }

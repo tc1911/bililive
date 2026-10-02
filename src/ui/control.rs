@@ -23,6 +23,8 @@
 //!   - `回车`：账号栏重新扫码；直播间信息栏进编辑 / 提交；分区栏选定 / 展开收起
 //!   - `Esc`：取消编辑 → 收起配置页，退到弹幕页就**停住**，退出只有 Ctrl+C
 //!   - `F2` / `F3` / `F6` 直接翻开配置页并跳到账号 / 分区 / 直播间信息
+//!   - `F4` 开播（**先弹确认层**，确认了才真发请求）/ `F5` 下播（不用确认）。
+//!     这两个跟 `Ctrl+R` 一样是全局的，两页里都能按
 //!
 //! 这里只改界面状态，不碰网络也不碰磁盘 —— 那三件事分别归 `api::login`、`api::area`
 //! 和 main（写回配置也是往通道里扔一个 `Action`，自己不落盘）。
@@ -34,6 +36,7 @@ use ratatui::widgets::*;
 use super::area_tree::{self, AreaTree, Row};
 use crate::api::area::AreaEvent;
 use crate::api::info::{self, InfoEvent, MAX_TITLE_CHARS};
+use crate::api::live::{LiveAction, LiveEvent, Stream, VerifyKind};
 use crate::api::login::LoginEvent;
 use crate::ui::cover::Cover;
 use crate::ui::qr;
@@ -73,8 +76,7 @@ impl Tab {
     }
 
     /// 顶栏那行按键提示。文案照抄 Go 版的 `tabHints` ——
-    /// 只有「推流码」那栏把「F4 开播 / F5 下播」去掉了：这两个键这一轮还没接，
-    /// 提示里挂一个按了没反应的键，比不写更坑人。
+    /// 「推流码」那栏的 F4 / F5 这一轮接上了，提示也跟着补回来。
     pub fn hint(self) -> &'static str {
         match self {
             Tab::Account => {
@@ -86,7 +88,9 @@ impl Tab {
             Tab::Info => {
                 "↑↓ 选一项    回车 编辑    再回车 提交    Esc 取消    Tab 换功能    Shift+Tab 回弹幕页"
             }
-            Tab::Stream => "Tab 换功能    Shift+Tab 回弹幕页    Esc 返回    （开播 / 下播下一步接）",
+            Tab::Stream => {
+                "F4 开播    F5 下播    回车 重查状态    Tab 换功能    Shift+Tab 回弹幕页    Esc 返回"
+            }
         }
     }
 
@@ -123,6 +127,56 @@ pub enum Action {
     SetTitle(String),
     /// 换封面：值可能是本地路径（任务那边先传图床）也可能已经是 hdslb 链接
     SetCover(String),
+    /// 进「推流码」栏 / 在那一栏按回车：去看一眼开播状态（只读的 `get_info`）
+    LoadLiveStatus,
+    /// 开播。**只有走完确认层**（确认层里选了「开播」再回车）才会出这一条 ——
+    /// 它会让直播间立刻对外可见、给粉丝推开播推送，不能顺手就发出去。
+    StartLive { area_v2: i64 },
+    /// 下播（不用确认）
+    StopLive,
+}
+
+/// 开播确认层的默认按钮。**默认落在「取消」上**：开播不可逆（直播间立刻对外可见、
+/// 粉丝收到推送），一个手滑的回车就出去的代价太大，宁可多按一下。
+const CONFIRM_BUTTONS: [&str; 2] = ["开播", "取消"];
+const CONFIRM_CANCEL: usize = 1;
+
+/// 确认层的文案，照 Go 版一字不改；拆行只是为了那个框画得下，连起来读还是那一句
+/// 「开播后直播间会立刻对外可见，粉丝会收到开播推送。确定开播？」。
+/// **别把整句塞成一行**：44 格宽的框里会被截断，而这句话正是要给人看清楚的。
+const CONFIRM_TEXT: [&str; 3] = [
+    "开播后直播间会立刻对外可见，",
+    "粉丝会收到开播推送。",
+    "确定开播？",
+];
+
+/// 开播确认层。`selected` 是 `CONFIRM_BUTTONS` 的下标。
+struct ConfirmStart {
+    selected: usize,
+}
+
+impl Default for ConfirmStart {
+    fn default() -> Self {
+        Self {
+            selected: CONFIRM_CANCEL,
+        }
+    }
+}
+
+/// 「推流码」栏最近一次开播状态查询的结果。
+///
+/// 跟 `streams`（开播成功拿到的那几路凭据）**分开存**：凭据只有开播那一下会返回一次，
+/// 而「刚开播那几秒服务端还可能回未开播」—— 拿一次状态查询去冲掉手上的凭据，
+/// 用户就会看着一栏空白以为自己开播失败了。
+enum LiveQuery {
+    /// 还没查过（进这一栏会自动查一次）
+    Idle,
+    /// 正在查
+    Loading,
+    /// 查到了：`data.live_status`（0 未开播 / 1 直播中 / 2 轮播）
+    Known(i64),
+    /// 没查到（网络 / 接口报错），原话留在这一栏里
+    Failed(String),
 }
 
 /// 分区栏的状态。
@@ -205,6 +259,15 @@ pub struct Control {
     saved_area_id: i64,
     /// 配置里那个分区的名字。只用在「表还没拉到」的时候告诉用户现在配的是什么。
     saved_area_name: String,
+    /// 「推流码」栏最近一次开播状态查询的结果
+    live: LiveQuery,
+    /// 开播成功拿到的各路推流凭据。下播成功后清掉。
+    streams: Vec<Stream>,
+    /// 开播确认层开着的时候是 `Some`
+    confirm: Option<ConfirmStart>,
+    /// 开播 / 下播请求还在路上。这期间不再发第二次（连按 F4/F5 只会被顶栏那句话挡住）
+    start_pending: bool,
+    stop_pending: bool,
 }
 
 impl Default for Control {
@@ -228,6 +291,11 @@ impl Default for Control {
             area: AreaState::Idle,
             saved_area_id: 0,
             saved_area_name: String::new(),
+            live: LiveQuery::Idle,
+            streams: Vec::new(),
+            confirm: None,
+            start_pending: false,
+            stop_pending: false,
         }
     }
 }
@@ -263,6 +331,13 @@ impl Control {
             }
             (Tab::Area, AreaState::Failed(_)) => {
                 "分区表没拉到：回车 重试    Tab 换功能    Shift+Tab 回弹幕页".to_string()
+            }
+            // 推流码栏这两条同理：状态在路上的时候说一声，没查到就把「回车重试」摆出来。
+            (Tab::Stream, _) if matches!(self.live, LiveQuery::Loading) => {
+                "正在查开播状态…    F4 开播    F5 下播    Tab 换功能".to_string()
+            }
+            (Tab::Stream, _) if matches!(self.live, LiveQuery::Failed(_)) => {
+                "开播状态没查到：回车 重试    F4 开播    F5 下播    Tab 换功能".to_string()
             }
             _ => self.tab.hint().to_string(),
         }
@@ -357,16 +432,7 @@ impl Control {
                 self.login_pending = false;
             }
             LoginEvent::Qr(content) => {
-                let mut lines = vec![
-                    Line::from(Span::styled(
-                        "用哔哩哔哩 App 扫码登录",
-                        Style::default().fg(Color::Yellow),
-                    )),
-                    Line::from(""),
-                ];
-                // 编不出来也只是画一行红字说明，绝不把整个界面带走
-                lines.extend(qr::lines(&content));
-                self.qr = lines;
+                self.show_qr(&content, "用哔哩哔哩 App 扫码登录");
             }
             LoginEvent::Hint(text) => self.set_message(text),
             LoginEvent::Failed(text) => {
@@ -383,6 +449,115 @@ impl Control {
     /// 用户切走再切回来也不会再问一次（屏幕上什么都不会发生）。
     pub fn info_request_dropped(&mut self) {
         self.info_meta_pending = false;
+    }
+
+    /// 那一下没能送进开播任务（队列满 / 任务没了）。
+    ///
+    /// 两个「正在发」的标志必须放掉：不放的话后面按 F4 / F5 会一直被自己挡住
+    /// （顶栏只说「请求还在路上」，而那个请求根本不存在）。
+    pub fn live_request_dropped(&mut self, what: &str) {
+        self.start_pending = false;
+        self.stop_pending = false;
+        // 查状态那一下没送出去，就得把「正在查」放掉：不放的话那一栏永远停在
+        // 「正在查开播状态…」，而回车还会被自己挡住（`reload_live_status` 见它
+        // 是 Loading 就只说一句「还在路上」）—— 屏幕上就再也没法让它重查了。
+        if matches!(self.live, LiveQuery::Loading) {
+            self.live = LiveQuery::Idle;
+        }
+        self.set_message(format!("{what}请求没送出去（开播任务正忙），再按一次试试"));
+    }
+
+    /// 把一段地址画进账号栏。登录二维码和开播验证码共用这一套渲染
+    /// （半格字符 + 真彩色在 `ui/qr.rs`，别在别处再拼一遍）。
+    fn show_qr(&mut self, content: &str, title: &str) {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                title.to_string(),
+                Style::default().fg(Color::Yellow),
+            )),
+            Line::from(""),
+        ];
+        // 编不出来也只是画一行红字说明，绝不把整个界面带走
+        lines.extend(qr::lines(content));
+        self.qr = lines;
+    }
+
+    /// 开播任务那边来的消息（状态 / 推流凭据 / 两种验证 / 成功失败）。
+    ///
+    /// 跟别的几条链一个口径：只动显示状态，失败只写顶栏那一行，
+    /// **绝不 panic、绝不退出**。
+    pub fn on_live_event(&mut self, ev: LiveEvent) {
+        match ev {
+            LiveEvent::Status { live_status } => {
+                self.live = LiveQuery::Known(live_status);
+                // 手上已经有凭据的时候别被状态查询冲掉顶栏那句话：刚开播那几秒
+                // 服务端还可能在回「未开播」，凭据其实是好的。
+                if self.streams.is_empty() {
+                    self.set_message(if live_status == 1 {
+                        "正在直播中"
+                    } else {
+                        "还没开播"
+                    });
+                }
+            }
+            LiveEvent::Started(streams) => {
+                self.start_pending = false;
+                self.stop_pending = false;
+                self.live = LiveQuery::Known(1);
+                self.streams = streams;
+                // 开播成功自动切到推流码栏（Go 版就这么做的）：开完播人最想看的就是
+                // 服务器和密钥，别让他再自己按一次 Tab。
+                self.tab = Tab::Stream;
+                self.page = Page::Config;
+                self.set_message("已开播");
+            }
+            LiveEvent::Verify { kind, url, message } => {
+                self.start_pending = false;
+                self.stop_pending = false;
+                // 两种验证都把码画到**账号栏**（复用那边的渲染），并且别说成「开播失败」——
+                // 扫完码再按 F4 就能开播，用户要的是二维码，不是一句错误。
+                self.tab = Tab::Account;
+                self.page = Page::Config;
+                if url.is_empty() {
+                    // 没拿到验证地址（60024 没带 qr、或者人脸认证那次 nav 也没问出 mid）：
+                    // 画不出码，只能让人再试一次。
+                    self.qr = vec![Line::from(Span::styled(
+                        "没拿到验证地址，按 F4 再试一次",
+                        Style::default().fg(Color::Yellow),
+                    ))];
+                    self.set_message(format!("{message}（没拿到验证地址，按 F4 再试一次）"));
+                } else {
+                    let title = match kind {
+                        VerifyKind::Qr => "开播需要验证：扫码后在手机上确认",
+                        VerifyKind::FaceAuth => "开播需要人脸认证：扫码后在手机上完成",
+                    };
+                    self.show_qr(&url, title);
+                    self.set_message(format!("{message}，扫完再按 F4"));
+                }
+            }
+            LiveEvent::Stopped => {
+                self.start_pending = false;
+                self.stop_pending = false;
+                self.live = LiveQuery::Known(0);
+                // 下播了，凭据就没用了（服务端下一次开播会换一组），清掉。
+                self.streams.clear();
+                self.set_message("已下播，推流码已清掉");
+            }
+            LiveEvent::Failed { action, message } => {
+                self.start_pending = false;
+                self.stop_pending = false;
+                let what = match action {
+                    LiveAction::Status => {
+                        // 状态没查到只影响这一栏：让它自己写一句话，别处不受影响。
+                        self.live = LiveQuery::Failed(message.clone());
+                        "读取开播状态失败"
+                    }
+                    LiveAction::Start => "开播失败",
+                    LiveAction::Stop => "下播失败",
+                };
+                self.set_message(format!("{what}：{message}"));
+            }
+        }
     }
 
     /// 信息任务那边来的消息（`Room/get_info` 的结果 / 改标题改封面的结果 / 封面图本身）。
@@ -440,12 +615,22 @@ impl Control {
 
     /// 喂一个按键。返回这一下有没有被配置页吃掉。
     pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Action {
-        // F2 / F3 / F6 是「直接翻开配置页并跳到某一栏」，在**哪一页**都该管用，
-        // 所以排在「现在是不是已经开着」前面。
+        // 确认层开着的时候，除了它自己那几个键什么都不认。
+        // 这一条**必须排在最前面**：`Tab` / `Esc` 漏到下面就会变成「换栏」「收起配置页」，
+        // 屏上那个框还开着、其实已经没人管它了（Go 版在 `Esc` 那儿特意写过同一个坑）。
+        if self.confirm.is_some() {
+            return self.confirm_key(code);
+        }
+
+        // F2 / F3 / F6 是「直接翻开配置页并跳到某一栏」，F4 / F5 是开播 / 下播，
+        // 在**哪一页**都该管用（跟 Ctrl+R / Ctrl+C 一样），所以排在
+        // 「现在是不是已经开着」前面。
         match code {
             KeyCode::F(2) => return self.open_tab(Tab::Account),
             KeyCode::F(3) => return self.open_tab(Tab::Area),
             KeyCode::F(6) => return self.open_tab(Tab::Info),
+            KeyCode::F(4) => return self.begin_start_live(),
+            KeyCode::F(5) => return self.begin_stop_live(),
             _ => {}
         }
 
@@ -497,10 +682,8 @@ impl Control {
                 // 分区栏：停在子分区上 = 选定它（把 area_id / area_name 传出去写回配置）；
                 // 停在父分区或「全部分区」上 = 展开 / 收起，跟 ←→ 一个意思。
                 Tab::Area => return self.area_enter(),
-                Tab::Stream => {
-                    let name = self.tab.name();
-                    self.set_message(format!("「{name}」这轮还没干活，下一步接"));
-                }
+                // 推流码栏的回车 = 重查一次开播状态（拉失败之后顶栏写的就是这个）。
+                Tab::Stream => return self.reload_live_status(),
             },
             KeyCode::Up | KeyCode::Down => {
                 let d = if code == KeyCode::Up { -1 } else { 1 };
@@ -566,6 +749,13 @@ impl Control {
         if self.tab == Tab::Info && !self.info_meta_pending && !self.info_meta_loaded {
             self.info_meta_pending = true;
             return Action::LoadRoomMeta;
+        }
+        // 推流码栏：没查过状态就自己查一次 —— 一进来就知道开没开播，
+        // 而不是摆一个空框让人自己找键。加载中 / 失败**不在这儿**自动重试
+        //（网络一抖的时候来回切栏会变成「每切一次打一次接口」，重试是回车的事）。
+        if self.tab == Tab::Stream && matches!(self.live, LiveQuery::Idle) {
+            self.live = LiveQuery::Loading;
+            return Action::LoadLiveStatus;
         }
         Action::Handled
     }
@@ -635,6 +825,107 @@ impl Control {
     fn close(&mut self) {
         self.cancel_edit();
         self.page = Page::Main;
+    }
+
+    /// 重查一次开播状态（进这一栏时、以及在那一栏按回车）。
+    fn reload_live_status(&mut self) -> Action {
+        if matches!(self.live, LiveQuery::Loading) {
+            self.set_message("开播状态还在路上…");
+            return Action::Handled;
+        }
+        self.live = LiveQuery::Loading;
+        self.set_message("正在查开播状态…");
+        Action::LoadLiveStatus
+    }
+
+    /// `F4`：开播。**先弹确认层**，绝不把请求直接发出去。
+    ///
+    /// 这一条排在「现在哪一页」前面 —— 跟 `Ctrl+R` 一样是全局键，弹幕页上按也要管用
+    /// （Go 版是全局 capture）。顺手把配置页翻开：确认框得画在第二页上。
+    fn begin_start_live(&mut self) -> Action {
+        self.page = Page::Config;
+        if !self.logged_in {
+            self.set_message("还没登录：先到「账号」栏扫码登录（回车 重新扫码）");
+            return Action::Handled;
+        }
+        if self.saved_area_id <= 0 {
+            // 分区是开播的必填项（`area_v2`），空着发出去只会换回一句听不懂的错。
+            // 所以在**发请求之前**就说清楚去哪儿选。
+            self.set_message("还没选开播分区：先到「分区」栏选一个（F3 直达）");
+            return Action::Handled;
+        }
+        if self.start_pending {
+            self.set_message("开播请求还在路上，等一下…");
+            return Action::Handled;
+        }
+        if !self.streams.is_empty() || matches!(self.live, LiveQuery::Known(1)) {
+            // 已经在播了：服务端再收一次 startLive 只会回一句「已经在直播中」，
+            // 不如在这儿拦住，顺便告诉用户下播按哪个键。
+            self.set_message("已经开播了（下播按 F5）");
+            return Action::Handled;
+        }
+        self.confirm = Some(ConfirmStart::default());
+        Action::Handled
+    }
+
+    /// `F5`：下播。**不用确认** —— 它不会让直播间突然对外可见，
+    /// 误按的后果是这一场断了，再按一次 F4 就能回来。
+    fn begin_stop_live(&mut self) -> Action {
+        self.page = Page::Config;
+        if !self.logged_in {
+            self.set_message("还没登录：先到「账号」栏扫码登录（回车 重新扫码）");
+            return Action::Handled;
+        }
+        if self.stop_pending {
+            self.set_message("下播请求还在路上，等一下…");
+            return Action::Handled;
+        }
+        if self.streams.is_empty() && matches!(self.live, LiveQuery::Known(s) if s != 1) {
+            // 只有「确定没在播」才拦。状态还没查过时照发 —— F5 不该因为
+            // 「没先看一眼状态」就什么都不做。
+            self.set_message("现在没在直播（开播按 F4）");
+            return Action::Handled;
+        }
+        self.stop_pending = true;
+        self.set_message("正在下播…");
+        Action::StopLive
+    }
+
+    /// 确认层里的按键：`Tab` / `←→` 换按钮，`回车` 按下去，`Esc` 取消。
+    fn confirm_key(&mut self, code: KeyCode) -> Action {
+        let last = CONFIRM_BUTTONS.len() - 1;
+        match code {
+            KeyCode::Enter => {
+                let selected = self.confirm.take().map_or(CONFIRM_CANCEL, |c| c.selected);
+                if selected == CONFIRM_CANCEL {
+                    self.set_message("已取消开播");
+                    return Action::Handled;
+                }
+                self.start_pending = true;
+                self.set_message("正在开播…");
+                Action::StartLive {
+                    area_v2: self.saved_area_id,
+                }
+            }
+            KeyCode::Esc => {
+                self.confirm = None;
+                self.set_message("已取消开播");
+                Action::Handled
+            }
+            KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                let Some(c) = self.confirm.as_mut() else {
+                    return Action::Handled;
+                };
+                // Tab 在两头之间绕圈；←→ 到头就停住（只有两个按钮的框这样最好猜）。
+                c.selected = match code {
+                    KeyCode::Tab => (c.selected + 1) % (last + 1),
+                    KeyCode::Right => (c.selected + 1).min(last),
+                    _ => c.selected.saturating_sub(1),
+                };
+                Action::Handled
+            }
+            _ => Action::Handled,
+        }
     }
 
     /// 只有两行，到头就绕回去。
@@ -797,13 +1088,69 @@ pub fn draw(f: &mut Frame, c: &Control, area: Rect) {
         Tab::Account => draw_account(f, c, inner),
         Tab::Info => draw_info(f, c, inner),
         Tab::Area => draw_area(f, c, inner),
-        Tab::Stream => draw_placeholder(
-            f,
-            inner,
-            "推流码",
-            "开播之后，这里会显示推流地址与推流码（下一步接）",
-        ),
+        Tab::Stream => draw_stream(f, c, inner),
     }
+
+    // 确认层画在最上层：它得盖住底下的栏。先 `Clear` 再画框 —— 不清的话
+    // 框里会透出下面那层的文字（半句标题混在确认文案里就没法看了）。
+    if let Some(confirm) = &c.confirm {
+        draw_confirm(f, area, confirm.selected);
+    }
+}
+
+/// 开播确认层：屏幕正中的一个带边框的框、两行文案、一排按钮。
+///
+/// 自己在 ratatui 里搭（Go 版用 tview 的 Modal）：需要的东西就这一个框，
+/// 为它铺一层 Pages 不值当。选中的按钮反色，另一个是灰的。
+fn draw_confirm(f: &mut Frame, area: Rect, selected: usize) {
+    // 宽 44 格够放下最长那行文案；终端比它还窄就跟着缩，缩到画不下干脆不画
+    //（画一半的框比没有框更让人看不明白）。
+    let width = 44.min(area.width);
+    let height = 7.min(area.height);
+    if width < 12 || height < 5 {
+        return;
+    }
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+
+    f.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(" 开播确认 ")
+        .style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(CONFIRM_TEXT[0]),
+            Line::from(CONFIRM_TEXT[1]),
+            Line::from(CONFIRM_TEXT[2]),
+            Line::from(""),
+            button_line(selected),
+        ])
+        .alignment(Alignment::Center),
+        inner,
+    );
+}
+
+/// `[ 开播 ]  [ 取消 ]`，选中的那个反色 —— 不反色就看不出回车会按到哪个。
+fn button_line(selected: usize) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, label) in CONFIRM_BUTTONS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if i == selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        spans.push(Span::styled(format!("[ {label} ]"), style));
+    }
+    Line::from(spans)
 }
 
 /// 分区栏：一棵两级树（「全部分区 → 父分区 → 子分区」）。
@@ -913,21 +1260,89 @@ fn draw_account(f: &mut Frame, c: &Control, area: Rect) {
     }
 }
 
-fn draw_placeholder(f: &mut Frame, area: Rect, name: &str, note: &str) {
-    f.render_widget(
-        Paragraph::new(vec![
+/// 「推流码」栏：手上有凭据就把服务器 / 密钥摆出来，否则按最近一次状态查询写一句话。
+///
+/// 密钥近百字符，**一行一个、不折行**（Go 版的教训：地址和密钥挤在一行里，
+/// 在终端里选中复制出来是断的）。`Paragraph` 不设 `wrap` 就是截断 ——
+/// 终端太窄时密钥尾部会被切掉，这是认了的取舍：折行会把一串密钥断成两行，更难复制。
+fn draw_stream(f: &mut Frame, c: &Control, area: Rect) {
+    if !c.streams.is_empty() {
+        f.render_widget(Paragraph::new(stream_lines(&c.streams)), area);
+        return;
+    }
+    let lines: Vec<Line<'static>> = match &c.live {
+        LiveQuery::Idle | LiveQuery::Loading => vec![Line::from(Span::styled(
+            "正在查开播状态…",
+            Style::default().fg(Color::DarkGray),
+        ))],
+        LiveQuery::Known(1) => vec![
+            Line::from(Span::styled("正在直播中", Style::default().fg(Color::Green))),
+            Line::from(""),
+            Line::from("推流地址与推流码只有 F4 开播那一下会返回一次。"),
+            Line::from("要拿到就把这一场下播（F5）再开一次（F4）。"),
+        ],
+        LiveQuery::Known(_) => vec![
             Line::from(Span::styled(
-                format!("{name} —— 下一步接"),
-                Style::default().fg(Color::DarkGray),
+                "还没开播，按 F4 开播",
+                Style::default().fg(Color::Gray),
             )),
             Line::from(""),
             Line::from(Span::styled(
-                note.to_string(),
+                "开播前先在「分区」栏选好开播分区；开播成功后这里会显示推流地址与推流码。",
                 Style::default().fg(Color::DarkGray),
             )),
-        ]),
-        area,
-    );
+        ],
+        LiveQuery::Failed(err) => vec![
+            Line::from(Span::styled(
+                format!("读不到开播状态：{err}"),
+                Style::default().fg(Color::Red),
+            )),
+            Line::from(""),
+            Line::from(Span::styled("回车 重试", Style::default().fg(Color::Yellow))),
+            Line::from(Span::styled(
+                "别的都不受影响：开播 / 下播照样能按",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
+    };
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+/// 一路凭据几行字：类型 / 服务器 / 密钥 / 完整 URL。
+/// 每个值**单独占一行**，就是为了让人能整行选中复制。
+fn stream_lines(streams: &[Stream]) -> Vec<Line<'static>> {
+    let label = |text: &'static str| {
+        Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "推流地址与推流码",
+            Style::default().fg(Color::Yellow),
+        )),
+        Line::from(""),
+    ];
+    for (i, s) in streams.iter().enumerate() {
+        let mut head = vec![Span::styled(s.kind.clone(), Style::default().fg(Color::White))];
+        if i == 0 {
+            head.push(Span::styled(
+                "（OBS 填这组）",
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        lines.push(Line::from(head));
+        lines.push(label("服务器"));
+        lines.push(Line::from(s.address.clone()));
+        lines.push(label("密钥"));
+        lines.push(Line::from(s.key.clone()));
+        lines.push(label("完整 URL"));
+        lines.push(Line::from(s.full_url.clone()));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        "直播间已对外可见；下播按 F5",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines
 }
 
 /// 「直播间信息」栏：上面两行字段（选中的那行带 ▸），中间两行说明，
@@ -1071,10 +1486,12 @@ mod tests {
             let action = c.handle_key(KeyCode::Tab, NONE);
             assert_eq!(c.tab(), want);
             // 分区栏一进去就自己去拉表（跟账号栏顺手要一张码是同一个「需要什么显示什么」）；
-            // 直播间信息栏同理，去拉一次当前标题 / 封面。别的栏换过去只是空换。
+            // 直播间信息栏同理，去拉一次当前标题 / 封面；推流码栏去看一眼开播状态。
+            // 别的栏换过去只是空换。
             match want {
                 Tab::Area => assert_eq!(action, Action::LoadAreas),
                 Tab::Info => assert_eq!(action, Action::LoadRoomMeta),
+                Tab::Stream => assert_eq!(action, Action::LoadLiveStatus),
                 _ => assert_eq!(action, Action::Handled),
             }
         }
@@ -1920,5 +2337,521 @@ mod tests {
             })
             .unwrap();
         }
+    }
+
+    // ------------------------------------------------------- 开播 / 下播
+
+    /// 登录过、配置里也选好了分区的那种状态（开播的两个前提）。
+    fn live_control() -> Control {
+        let mut c = logged_in();
+        c.seed_area(371, "虚拟主播/虚拟日常");
+        c
+    }
+
+    fn stream() -> Stream {
+        Stream {
+            kind: "rtmp-1".into(),
+            protocol: "rtmp".into(),
+            address: "rtmp://live-push.bilivideo.com/live-bvc".into(),
+            key: "?streamname=abc".into(),
+            full_url: "rtmp://live-push.bilivideo.com/live-bvc?streamname=abc".into(),
+        }
+    }
+
+    /// 一屏的字拼起来（画一帧再读回来），只看「有没有那句话」时用它。
+    fn text_of(c: &Control, w: u16, h: u16) -> String {
+        flat(
+            &screen(c, w, h)
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
+    /// F4 的确认层：默认落在「取消」上（手滑一个回车不该把直播间送出去），
+    /// Tab 换按钮、回车按选中的那个、Esc 取消。**弹幕页上按也管用**。
+    #[test]
+    fn the_start_confirm_layer_defaults_to_cancel() {
+        let mut c = live_control();
+        assert_eq!(c.page(), Page::Main);
+        assert_eq!(c.handle_key(KeyCode::F(4), NONE), Action::Handled);
+        assert_eq!(c.page(), Page::Config, "F4 是全局键，顺便把配置页翻开");
+        assert_eq!(
+            c.confirm.as_ref().map(|m| m.selected),
+            Some(CONFIRM_CANCEL),
+            "默认选「取消」"
+        );
+
+        // 默认那一下回车 = 取消：不许冒出 StartLive
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::Handled);
+        assert!(c.confirm.is_none(), "回车之后确认层要收起来");
+        assert!(c.message.contains("已取消"), "{}", c.message);
+        assert!(!c.start_pending);
+
+        // Tab 换到「开播」再回车：这才真的发请求（带上配置里那个分区）
+        c.handle_key(KeyCode::F(4), NONE);
+        assert_eq!(c.handle_key(KeyCode::Tab, NONE), Action::Handled);
+        assert_eq!(
+            c.handle_key(KeyCode::Enter, NONE),
+            Action::StartLive { area_v2: 371 }
+        );
+        assert!(c.start_pending);
+        assert!(c.message.contains("正在开播"), "{}", c.message);
+        assert!(c.confirm.is_none(), "确认层得收掉，不然它会一直盖着");
+
+        // ←→ 也能选；Esc 只收确认层，不许把配置页一起收掉
+        c.on_live_event(LiveEvent::Failed {
+            action: LiveAction::Start,
+            message: "x".into(),
+        });
+        c.handle_key(KeyCode::F(4), NONE);
+        assert_eq!(c.handle_key(KeyCode::Left, NONE), Action::Handled);
+        assert_eq!(c.confirm.as_ref().map(|m| m.selected), Some(0), "← 选到「开播」");
+        assert_eq!(c.handle_key(KeyCode::Right, NONE), Action::Handled);
+        assert_eq!(c.confirm.as_ref().map(|m| m.selected), Some(1));
+        assert_eq!(c.handle_key(KeyCode::Esc, NONE), Action::Handled);
+        assert!(c.confirm.is_none());
+        assert_eq!(c.page(), Page::Config, "Esc 只该收确认层");
+        assert!(c.message.contains("已取消"), "{}", c.message);
+    }
+
+    /// 确认层开着的时候别的键都得被它吃掉：漏到下面就成了「换栏」「收起配置页」，
+    /// 屏上那个框还开着、其实已经没人管它了（Go 版在 Esc 那儿踩过同一个坑）。
+    #[test]
+    fn the_confirm_layer_swallows_everything_else() {
+        let mut c = live_control();
+        c.handle_key(KeyCode::F(4), NONE);
+        let tab = c.tab();
+        for code in [
+            KeyCode::BackTab,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::F(3),
+            KeyCode::F(5),
+            KeyCode::Char('x'),
+        ] {
+            assert_eq!(c.handle_key(code, NONE), Action::Handled, "{code:?}");
+        }
+        assert!(c.confirm.is_some(), "这些键都不该把它关掉");
+        assert_eq!(c.page(), Page::Config, "也不该把配置页收掉");
+        assert_eq!(c.tab(), tab, "也不该换栏");
+    }
+
+    /// 没选分区 / 没登录就按 F4：说清楚去哪儿办，**连确认层都不弹**
+    /// （一个注定要失败的请求不该先让用户确认一遍）。
+    #[test]
+    fn f4_without_an_area_or_login_says_what_to_do_first() {
+        let mut c = logged_in(); // 没 seed_area
+        assert_eq!(c.handle_key(KeyCode::F(4), NONE), Action::Handled);
+        assert!(c.confirm.is_none(), "没分区就不该弹确认层");
+        assert!(c.message.contains("分区"), "{}", c.message);
+        assert!(!c.start_pending);
+
+        let mut c = Control::default(); // 没登录，但分区选好了
+        c.seed_area(371, "虚拟主播/虚拟日常");
+        assert_eq!(c.handle_key(KeyCode::F(4), NONE), Action::Handled);
+        assert!(c.confirm.is_none());
+        assert!(c.message.contains("登录"), "{}", c.message);
+    }
+
+    /// 已经在播（手上有凭据，或者状态说在播）：F4 不该再弹一次确认 ——
+    /// 服务端再收一次 startLive 只会回一句「已经在直播中」。
+    #[test]
+    fn f4_when_already_live_does_not_ask_to_confirm_again() {
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Started(vec![stream()]));
+        assert_eq!(c.handle_key(KeyCode::F(4), NONE), Action::Handled);
+        assert!(c.confirm.is_none());
+        assert!(c.message.contains("已经开播"), "{}", c.message);
+
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Status { live_status: 1 });
+        c.handle_key(KeyCode::F(4), NONE);
+        assert!(c.confirm.is_none(), "状态说在播，就别再确认一遍了");
+        assert!(c.message.contains("已经开播"), "{}", c.message);
+    }
+
+    /// F5 下播：**不用确认**，弹幕页上按也行；路上不重复发；确定没在播时只写一句话。
+    #[test]
+    fn f5_stops_without_any_confirmation() {
+        let mut c = live_control();
+        assert_eq!(c.handle_key(KeyCode::F(5), NONE), Action::StopLive);
+        assert_eq!(c.page(), Page::Config);
+        assert!(c.confirm.is_none(), "下播不弹确认层");
+        assert!(c.stop_pending);
+        assert!(c.message.contains("正在下播"), "{}", c.message);
+
+        // 请求还在路上：再按不重复发
+        assert_eq!(c.handle_key(KeyCode::F(5), NONE), Action::Handled);
+        assert!(c.message.contains("还在路上"), "{}", c.message);
+
+        // 状态说没在播（手上也没有凭据）：拦下来，别发一个没意义的请求
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Status { live_status: 0 });
+        assert_eq!(c.handle_key(KeyCode::F(5), NONE), Action::Handled);
+        assert!(c.message.contains("没在直播"), "{}", c.message);
+        assert!(!c.stop_pending);
+    }
+
+    /// 那一下没送进开播任务时要把「正在发」放掉：不放的话以后按 F4 / F5
+    /// 永远被自己挡住（顶栏只说「还在路上」，而那个请求根本不存在）。
+    #[test]
+    fn a_dropped_live_request_can_be_tried_again() {
+        let mut c = live_control();
+        c.handle_key(KeyCode::F(4), NONE);
+        c.handle_key(KeyCode::Tab, NONE);
+        assert_eq!(
+            c.handle_key(KeyCode::Enter, NONE),
+            Action::StartLive { area_v2: 371 }
+        );
+        // 路上再按：被挡
+        assert_eq!(c.handle_key(KeyCode::F(4), NONE), Action::Handled);
+        assert!(c.confirm.is_none());
+
+        c.live_request_dropped("开播");
+        assert!(!c.start_pending);
+        assert!(c.message.contains("没送出去"), "{}", c.message);
+        c.handle_key(KeyCode::F(4), NONE);
+        assert!(c.confirm.is_some(), "放掉之后要能重新来一次");
+    }
+
+    /// 查状态那一下没送出去也得能重来：不然那一栏永远停在「正在查开播状态…」，
+    /// 按回车还被自己挡住（屏幕上再也没有别的路能让它重查）。
+    #[test]
+    fn a_dropped_status_query_can_be_asked_again() {
+        let mut c = live_control();
+        c.handle_key(KeyCode::BackTab, NONE);
+        c.tab = Tab::Stream;
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::LoadLiveStatus);
+        assert!(matches!(c.live, LiveQuery::Loading));
+
+        c.live_request_dropped("查状态");
+        assert!(matches!(c.live, LiveQuery::Idle), "要把「正在查」放掉");
+        assert_eq!(
+            c.handle_key(KeyCode::Enter, NONE),
+            Action::LoadLiveStatus,
+            "放掉之后回车能再查一次"
+        );
+    }
+
+    /// 进「推流码」栏去看一眼开播状态（只读）；还在查的时候绕回来不再问，
+    /// 查到过之后也不重问 —— 跟分区栏 / 信息栏一个口径。
+    #[test]
+    fn entering_the_stream_tab_asks_for_the_status_once() {
+        let mut c = live_control();
+        c.handle_key(KeyCode::BackTab, NONE); // 账号栏
+        assert_eq!(c.handle_key(KeyCode::Tab, NONE), Action::LoadAreas);
+        assert_eq!(c.handle_key(KeyCode::Tab, NONE), Action::LoadRoomMeta);
+        assert_eq!(c.handle_key(KeyCode::Tab, NONE), Action::LoadLiveStatus);
+        assert_eq!(c.tab(), Tab::Stream);
+
+        // 还在查：绕一圈回来不再问
+        for _ in 0..4 {
+            c.handle_key(KeyCode::Tab, NONE);
+        }
+        assert_eq!(c.tab(), Tab::Stream);
+
+        // 状态到了之后切走再切回来，也不自动重问
+        c.on_live_event(LiveEvent::Status { live_status: 0 });
+        c.handle_key(KeyCode::Tab, NONE);
+        c.handle_key(KeyCode::Tab, NONE);
+        c.handle_key(KeyCode::Tab, NONE);
+        assert_eq!(
+            c.handle_key(KeyCode::Tab, NONE),
+            Action::Handled,
+            "查到过就不再自动问"
+        );
+    }
+
+    /// 推流码栏里回车 = 重查一次状态（拉失败之后顶栏写的就是「回车 重试」）。
+    #[test]
+    fn enter_in_the_stream_tab_rechecks_the_status() {
+        let mut c = live_control();
+        c.handle_key(KeyCode::BackTab, NONE); // 先翻开配置页（不然键都归弹幕页）
+        c.tab = Tab::Stream;
+        c.live = LiveQuery::Failed("网络不可达".into());
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::LoadLiveStatus);
+        assert!(matches!(c.live, LiveQuery::Loading));
+        // 还在路上再按：不重复发
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::Handled);
+        assert!(c.message.contains("还在路上"), "{}", c.message);
+    }
+
+    /// 开播成功：自动切到推流码栏（Go 版就这么做的）、凭据摆上、顶栏写「已开播」。
+    #[test]
+    fn a_successful_start_switches_to_the_stream_tab() {
+        let mut c = live_control();
+        c.handle_key(KeyCode::F(4), NONE);
+        c.handle_key(KeyCode::Tab, NONE);
+        assert_eq!(
+            c.handle_key(KeyCode::Enter, NONE),
+            Action::StartLive { area_v2: 371 }
+        );
+        c.on_live_event(LiveEvent::Started(vec![stream()]));
+        assert_eq!(c.tab(), Tab::Stream, "开播成功要自动切到推流码栏");
+        assert_eq!(c.page(), Page::Config);
+        assert_eq!(c.streams.len(), 1);
+        assert_eq!(c.message, "已开播");
+        assert!(!c.start_pending);
+
+        // 那一栏真把服务器与密钥摆出来了
+        let text = text_of(&c, 160, 40);
+        assert!(text.contains("rtmp-1"), "{text}");
+        assert!(
+            text.contains("rtmp://live-push.bilivideo.com/live-bvc"),
+            "{text}"
+        );
+        assert!(text.contains("?streamname=abc"), "{text}");
+        assert!(text.contains("完整URL"), "{text}");
+        assert!(text.contains("OBS填这组"), "{text}");
+    }
+
+    /// 下播成功：凭据清掉、状态回到未开播（那一栏又说「还没开播，按 F4 开播」）。
+    #[test]
+    fn stopping_clears_the_credentials_and_the_state() {
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Started(vec![stream()]));
+        assert!(!c.streams.is_empty());
+        assert!(text_of(&c, 160, 40).contains("rtmp-1"));
+
+        c.on_live_event(LiveEvent::Stopped);
+        assert!(c.streams.is_empty(), "下播成功要把推流码清掉");
+        assert!(matches!(c.live, LiveQuery::Known(0)));
+        assert!(c.message.contains("已下播"), "{}", c.message);
+        let text = text_of(&c, 160, 40);
+        assert!(text.contains("还没开播"), "{text}");
+        assert!(!text.contains("rtmp-1"), "推流码不该还留在屏幕上：{text}");
+    }
+
+    /// 两种验证都画到**账号栏**、都说「扫完再按 F4」，**不是**「开播失败」。
+    #[test]
+    fn verification_draws_the_qr_on_the_account_tab() {
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Verify {
+            kind: VerifyKind::Qr,
+            url: "https://www.bilibili.com/h5/verify?token=abcdefgh".into(),
+            message: "本次开播需要扫码验证：请扫码验证".into(),
+        });
+        assert_eq!(c.tab(), Tab::Account, "验证码画在账号栏");
+        assert!(c.message.contains("扫完再按 F4"), "{}", c.message);
+        assert!(!c.message.contains("失败"), "{}", c.message);
+        let rows = screen(&c, 120, 48);
+        assert!(
+            rows.iter()
+                .any(|(t, _)| t.contains('▀') || t.contains('▄') || t.contains('█')),
+            "二维码要真画出来：\n{rows:#?}"
+        );
+        assert!(
+            text_of(&c, 120, 48).contains("扫码后在手机上确认"),
+            "码上面得写清楚这是干什么的"
+        );
+
+        // 人脸认证那条：地址是拼好的那个，也画成码
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Verify {
+            kind: VerifyKind::FaceAuth,
+            url: "https://www.bilibili.com/blackboard/live/face-auth-middle.html?source_event=400&mid=42"
+                .into(),
+            message: "本次开播需要人脸认证：请先完成人脸认证".into(),
+        });
+        assert_eq!(c.tab(), Tab::Account);
+        assert!(c.message.contains("人脸认证"), "{}", c.message);
+        assert!(c.message.contains("扫完再按 F4"), "{}", c.message);
+        assert!(text_of(&c, 120, 48).contains("人脸认证"), "码上面得写清楚是去认证");
+
+        // 没拿到验证地址：还是「要验证」这件事，只是画不出码，让人再按一次 F4
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Verify {
+            kind: VerifyKind::Qr,
+            url: String::new(),
+            message: "本次开播需要扫码验证：请扫码验证".into(),
+        });
+        assert_eq!(c.tab(), Tab::Account);
+        assert!(c.message.contains("没拿到验证地址"), "{}", c.message);
+        assert!(c.message.contains("按 F4 再试一次"), "{}", c.message);
+    }
+
+    /// 失败只写顶栏那句话（带出服务端原话），绝不 panic、绝不退出；
+    /// 状态查不到只影响推流码那一栏。
+    #[test]
+    fn a_failed_live_action_only_writes_a_line_in_the_top_bar() {
+        let mut c = live_control();
+        c.handle_key(KeyCode::F(4), NONE);
+        c.handle_key(KeyCode::Tab, NONE);
+        c.handle_key(KeyCode::Enter, NONE);
+        c.on_live_event(LiveEvent::Failed {
+            action: LiveAction::Start,
+            message: "/room/v1/Room/startLive 返回 -400: 已经在直播中".into(),
+        });
+        assert!(c.message.contains("开播失败"), "{}", c.message);
+        assert!(
+            c.message.contains("已经在直播中"),
+            "服务端原话要带出来：{}",
+            c.message
+        );
+        assert!(!c.start_pending, "失败之后要能再试一次");
+        assert_eq!(c.page(), Page::Config, "失败不该把页面也带走");
+        assert!(c.confirm.is_none());
+
+        c.on_live_event(LiveEvent::Failed {
+            action: LiveAction::Status,
+            message: "请求被拦截".into(),
+        });
+        assert!(matches!(c.live, LiveQuery::Failed(_)), "那一栏自己留着失败原因");
+        assert!(c.message.contains("读取开播状态失败"), "{}", c.message);
+        assert!(text_of(&c, 120, 30).contains("请求被拦截"));
+
+        c.on_live_event(LiveEvent::Failed {
+            action: LiveAction::Stop,
+            message: "没在直播".into(),
+        });
+        assert!(c.message.contains("下播失败"), "{}", c.message);
+        assert!(c.message.contains("没在直播"), "{}", c.message);
+        assert!(!c.stop_pending);
+    }
+
+    /// 推流码栏的顶栏提示要写清楚 F4 / F5（这一轮才把两个键接上）；
+    /// 状态在路上 / 没查到时换成对应的那句。
+    #[test]
+    fn the_stream_hint_mentions_f4_and_f5() {
+        let mut c = live_control();
+        c.tab = Tab::Stream;
+        assert!(c.hint().contains("F4 开播"), "{}", c.hint());
+        assert!(c.hint().contains("F5 下播"), "{}", c.hint());
+
+        c.live = LiveQuery::Loading;
+        assert!(c.hint().contains("正在查"), "{}", c.hint());
+        assert!(c.hint().contains("F4 开播"), "{}", c.hint());
+
+        c.live = LiveQuery::Failed("网络不可达".into());
+        assert!(c.hint().contains("回车 重试"), "{}", c.hint());
+    }
+
+    /// 未开播 / 在播（但手上没凭据），那一栏各说各的（未开播时得告诉人按 F4）。
+    #[test]
+    fn the_stream_pane_explains_every_state() {
+        let mut c = live_control();
+        c.tab = Tab::Stream;
+
+        c.on_live_event(LiveEvent::Status { live_status: 0 });
+        let text = text_of(&c, 120, 30);
+        assert!(text.contains("还没开播"), "{text}");
+        assert!(text.contains("F4开播"), "{text}");
+
+        c.on_live_event(LiveEvent::Status { live_status: 1 });
+        let text = text_of(&c, 120, 30);
+        assert!(text.contains("正在直播中"), "{text}");
+        assert!(
+            text.contains("只有F4开播那一下会返回一次"),
+            "在播但手上没凭据时要说清楚为什么这一栏是空的：{text}"
+        );
+    }
+
+    /// 密钥近百字符：服务器 / 密钥 / 完整 URL **一行一个、不折行** ——
+    /// 折了行在终端里选中复制出来就断了。窄终端下宁可截断（这是认了的取舍）。
+    #[test]
+    fn the_stream_pane_puts_each_credential_on_its_own_line() {
+        let key = format!("?streamname={}&key={}", "a".repeat(40), "b".repeat(40));
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Started(vec![Stream {
+            kind: "rtmp-1".into(),
+            protocol: "rtmp".into(),
+            address: "rtmp://live-push.bilivideo.com/live-bvc".into(),
+            key: key.clone(),
+            full_url: format!("rtmp://live-push.bilivideo.com/live-bvc{key}"),
+        }]));
+
+        // 够宽：整条密钥待在一行里，标签也都在
+        let rows = screen(&c, 200, 40);
+        let hit = rows
+            .iter()
+            .find(|(t, _)| t.contains(&key[..20]))
+            .expect("密钥那一行得画出来");
+        assert!(flat(&hit.0).contains(&flat(&key)), "完整的密钥要在一行里");
+        let text = text_of(&c, 200, 40);
+        for label in ["服务器", "密钥", "完整URL"] {
+            assert!(text.contains(label), "缺了「{label}」：{text}");
+        }
+
+        // 窄终端：不折行 —— 密钥的尾巴不会跑到别的行上去（被截断）
+        let rows = screen(&c, 60, 40);
+        let tail: String = key.chars().skip(60).take(10).collect();
+        assert!(
+            !rows.iter().any(|(t, _)| flat(t).contains(&flat(&tail))),
+            "密钥不许折行：\n{rows:#?}"
+        );
+    }
+
+    /// 确认层 + 推流码栏在各种小终端下画一遍，只为了确认不 panic
+    /// （框比屏幕宽时得自己让位，不能算出负数）。
+    #[test]
+    fn drawing_the_confirm_layer_never_panics() {
+        let sizes = [(120u16, 40u16), (16, 5), (1, 1), (40, 8)];
+
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Started(vec![stream()]));
+        assert_eq!(c.tab(), Tab::Stream);
+        for (w, h) in sizes {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| {
+                let area = f.area();
+                draw(f, &c, area);
+            })
+            .unwrap();
+        }
+
+        let mut c = live_control();
+        c.handle_key(KeyCode::F(4), NONE);
+        assert!(c.confirm.is_some());
+        for (w, h) in sizes {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| {
+                let area = f.area();
+                draw(f, &c, area);
+            })
+            .unwrap();
+        }
+    }
+
+    /// 确认框真画出来了：标题 + 两行文案 + 两个按钮，而且**只有一个按钮反色**
+    /// （两个都反色用户就不知道回车会按到哪个）。
+    #[test]
+    fn the_confirm_box_shows_both_buttons_and_only_one_selected() {
+        let mut c = live_control();
+        c.handle_key(KeyCode::F(4), NONE);
+        let rows = screen(&c, 100, 30);
+        let text = flat(
+            &rows
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        for want in [
+            "开播确认",
+            "开播后直播间会立刻对外可见，",
+            "粉丝会收到开播推送。",
+            "确定开播？",
+            "[开播]",
+            "[取消]",
+        ] {
+            assert!(text.contains(&flat(want)), "确认框里缺了「{want}」：\n{text}");
+        }
+
+        let reversed: Vec<&(String, bool)> = rows.iter().filter(|(_, r)| *r).collect();
+        assert_eq!(reversed.len(), 1, "只该有一个按钮反色：\n{rows:#?}");
+        assert!(
+            flat(&reversed[0].0).contains("[取消]"),
+            "默认选中的是「取消」：{}",
+            reversed[0].0
+        );
+
+        // Tab 之后换成「开播」反色
+        c.handle_key(KeyCode::Tab, NONE);
+        let rows = screen(&c, 100, 30);
+        let reversed: Vec<&(String, bool)> = rows.iter().filter(|(_, r)| *r).collect();
+        assert_eq!(reversed.len(), 1);
+        assert!(flat(&reversed[0].0).contains("[开播]"), "{}", reversed[0].0);
     }
 }

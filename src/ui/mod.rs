@@ -26,6 +26,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use crate::api::area::{AreaEvent, AreaRequest};
 use crate::api::danmaku::DanmuMsg;
 use crate::api::info::{InfoEvent, InfoRequest};
+use crate::api::live::{LiveEvent, LiveRequest};
 use crate::api::login::LoginEvent;
 use crate::api::room::{self, OnlineRankUser, RoomInfo};
 use crate::config::Config;
@@ -83,6 +84,10 @@ pub struct Wiring {
     pub info: Sender<InfoRequest>,
     /// 信息任务 -> 界面
     pub info_events: Receiver<InfoEvent>,
+    /// 界面 -> 开播任务：查开播状态 / 开播 / 下播
+    pub live: Sender<LiveRequest>,
+    /// 开播任务 -> 界面
+    pub live_events: Receiver<LiveEvent>,
 }
 
 fn setup() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
@@ -326,6 +331,8 @@ async fn event_loop(
         area_events: mut area_rx,
         info: info_tx,
         info_events: mut info_rx,
+        live: live_tx,
+        live_events: mut live_rx,
     } = w;
     let mut app = App::default();
     // 配置里记着的开播分区得先进界面：分区树要等分区表回来才建，而「展开哪个父分区、
@@ -352,6 +359,9 @@ async fn event_loop(
         }
         while let Ok(ev) = info_rx.try_recv() {
             app.control.on_info_event(ev);
+        }
+        while let Ok(ev) = live_rx.try_recv() {
+            app.control.on_live_event(ev);
         }
 
         terminal.draw(|f| draw(f, &app, &cfg))?;
@@ -421,6 +431,25 @@ async fn event_loop(
                     Action::SetCover(cover) => {
                         if info_tx.try_send(InfoRequest::SetCover(cover)).is_err() {
                             app.control.set_message("信息任务正忙，这次换封面没提交，再回车试一次");
+                        }
+                    }
+                    // 开播那三下都归开播任务。**开播 / 下播都是写操作**：
+                    // 只有走完确认层（`Action::StartLive`）才会发出去。
+                    Action::LoadLiveStatus => {
+                        if live_tx.try_send(LiveRequest::LoadStatus).is_err() {
+                            // 这一下没送出去就得把「正在查」放掉：不然那一栏永远停在
+                            // 「正在查开播状态…」，而那个请求根本不会被发。
+                            app.control.live_request_dropped("查状态");
+                        }
+                    }
+                    Action::StartLive { area_v2 } => {
+                        if live_tx.try_send(LiveRequest::Start { area_v2 }).is_err() {
+                            app.control.live_request_dropped("开播");
+                        }
+                    }
+                    Action::StopLive => {
+                        if live_tx.try_send(LiveRequest::Stop).is_err() {
+                            app.control.live_request_dropped("下播");
                         }
                     }
                     Action::ToMain => {
