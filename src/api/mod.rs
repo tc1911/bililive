@@ -3,6 +3,7 @@
 pub mod client;
 pub mod danmaku;
 pub mod room;
+pub mod send;
 pub mod wbi;
 
 /// 只给测试用的假 HTTP 服务器。

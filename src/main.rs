@@ -39,11 +39,22 @@ async fn main() -> Result<()> {
     let (room_tx, room_rx) = mpsc::channel(16);
     // 容量 1 的手动刷新信号：连按几下也只补一次，而且发送方永不阻塞。
     let (refresh_tx, refresh_rx) = mpsc::channel::<()>(1);
+    // 界面 -> 发送端。有界：界面卡住时最多堆这么多条，不会把内存吃光；
+    // 界面那侧用 try_send，永远不等发送端（发送端在切段之间要 sleep 1 秒）。
+    let (send_tx, send_rx) = mpsc::channel::<String>(32);
 
     if cfg.room_id > 0 {
         tokio::spawn(api::danmaku::supervisor(
             cfg.room_id,
             client.clone(),
+            danmu_tx.clone(),
+        ));
+        // 发弹幕跟收弹幕共用一个 client（同一份 cookie 和请求头）。
+        tokio::spawn(api::send::send_loop(
+            client.clone(),
+            LIVE_BASE.to_string(),
+            cfg.room_id,
+            send_rx,
             danmu_tx.clone(),
         ));
         tokio::spawn(api::room::sync_loop(
@@ -63,5 +74,5 @@ async fn main() -> Result<()> {
         let _ = danmu_tx.send(DanmuMsg::system(hint)).await;
     }
 
-    ui::run(cfg, danmu_rx, room_rx, refresh_tx).await
+    ui::run(cfg, danmu_rx, room_rx, refresh_tx, send_tx).await
 }

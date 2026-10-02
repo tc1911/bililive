@@ -40,14 +40,18 @@ pub const HEADER_ROWS: u16 = BANNER.len() as u16 + 2;
 /// 而且旧的也没人会往上翻（Go 版是无上限往 TextView 里塞）。
 const MAX_LINES: usize = 500;
 
+/// 输入历史最多记这么多条（跟 Go 版一致，最旧的挤掉）。
+const HISTORY_MAX: usize = 10;
+
 pub async fn run(
     cfg: Config,
     danmu_rx: Receiver<DanmuMsg>,
     room_rx: Receiver<RoomInfo>,
     refresh_tx: Sender<()>,
+    send_tx: Sender<String>,
 ) -> Result<()> {
     let mut terminal = setup()?;
-    let res = event_loop(&mut terminal, cfg, danmu_rx, room_rx, refresh_tx).await;
+    let res = event_loop(&mut terminal, cfg, danmu_rx, room_rx, refresh_tx, send_tx).await;
     restore()?;
     res
 }
@@ -73,6 +77,134 @@ struct App {
     room: Option<RoomInfo>,
     /// 多行模式下上一次发言的人/类型/分钟，用来决定要不要重打一遍名字
     last_group: Option<(String, String, String)>,
+    input: Input,
+}
+
+/// 底部那个输入框。
+///
+/// 缓冲区和光标都按**字符**存：中文一个字是一个元素。按字节存的话退格会退掉
+/// 三分之一个字，终端上显示成一格方块，回车发出去还是乱码（风控也会拦）。
+#[derive(Default)]
+struct Input {
+    buf: Vec<char>,
+    /// 光标位置，取值区间 `0..=buf.len()`
+    cursor: usize,
+    /// 最近发出去的几条，最旧的在前面
+    history: Vec<String>,
+    /// 正在翻历史的位置；`== history.len()` 表示「没在翻，编辑的是新内容」。
+    /// 口径跟 Go 版一致，翻到底的边界行为才对得上。
+    hist_idx: usize,
+}
+
+impl Input {
+    fn text(&self) -> String {
+        self.buf.iter().collect()
+    }
+
+    fn set_text(&mut self, text: &str) {
+        self.buf = text.chars().collect();
+        self.cursor = self.buf.len();
+    }
+
+    fn insert(&mut self, c: char) {
+        let at = self.cursor.min(self.buf.len());
+        self.buf.insert(at, c);
+        self.cursor = at + 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.buf.remove(self.cursor - 1);
+            self.cursor -= 1;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.buf.len() {
+            self.buf.remove(self.cursor);
+        }
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.buf.len());
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.cursor = 0;
+    }
+
+    /// ↑：往更旧的一条翻。已经在最旧的那条上就停住（不循环，翻历史时最怕绕圈）。
+    fn history_up(&mut self) {
+        if self.hist_idx > 0
+            && let Some(t) = self.history.get(self.hist_idx - 1).cloned()
+        {
+            self.hist_idx -= 1;
+            self.set_text(&t);
+        }
+    }
+
+    /// ↓：往更新的一条翻；翻到最后一条再按一下就回到空白的新内容。
+    /// Go 版就是这个行为 —— 翻到底还留着上一条，用户会以为按键没反应。
+    fn history_down(&mut self) {
+        if self.hist_idx + 1 < self.history.len() {
+            self.hist_idx += 1;
+            let t = self.history[self.hist_idx].clone();
+            self.set_text(&t);
+        } else {
+            self.hist_idx = self.history.len();
+            self.clear();
+        }
+    }
+
+    /// 回车。返回要发出去的文本；空串（或只有空格）不算一条，也不进历史。
+    /// 无论发不发，输入框都会清干净并回到「没在翻历史」的位置。
+    fn submit(&mut self) -> Option<String> {
+        let text = self.text().trim().to_string();
+        self.clear();
+        self.hist_idx = self.history.len();
+        if text.is_empty() {
+            return None;
+        }
+        self.history.push(text.clone());
+        if self.history.len() > HISTORY_MAX {
+            self.history.remove(0);
+        }
+        self.hist_idx = self.history.len();
+        Some(text)
+    }
+
+    /// 喂一个按键。返回 `Some` 表示这一下要发出去。
+    ///
+    /// **不处理 Ctrl+C / Ctrl+R** —— 那两个是全局的，调用方在喂进来之前就拦掉了，
+    /// 这里也不当文字收（见下面那条 `KeyCode::Char` 的守卫）。
+    fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Option<String> {
+        match code {
+            KeyCode::Enter => return self.submit(),
+            KeyCode::Backspace => self.backspace(),
+            KeyCode::Delete => self.delete(),
+            KeyCode::Left => self.left(),
+            KeyCode::Right => self.right(),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.buf.len(),
+            KeyCode::Up => self.history_up(),
+            KeyCode::Down => self.history_down(),
+            // Ctrl+U 清空（跟 Go 版同一个键）。这条要排在下面那条普通字符之前，
+            // 否则 Ctrl+U 会被当成「输入了一个 u」。
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => self.clear(),
+            // 带 Ctrl/Alt 的键一律不当文字收：除了全局那几个，剩下的插进去
+            // 也只是控制字符，屏幕上什么都看不见，还会莫名其妙地进请求体。
+            KeyCode::Char(c) if !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                self.insert(c)
+            }
+            _ => {}
+        }
+        None
+    }
 }
 
 impl App {
@@ -153,6 +285,7 @@ async fn event_loop(
     mut danmu_rx: Receiver<DanmuMsg>,
     mut room_rx: Receiver<RoomInfo>,
     refresh_tx: Sender<()>,
+    send_tx: Sender<String>,
 ) -> Result<()> {
     let mut app = App::default();
     loop {
@@ -176,7 +309,20 @@ async fn event_loop(
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
                 // 手动刷房间信息（跟 Go 版的 Ctrl+R 一致），不等那 30 秒。
                 (KeyCode::Char('r'), KeyModifiers::CONTROL) => room::refresh(&refresh_tx),
-                _ => {}
+                // 剩下的都归输入框。这两个全局键排在最前面，所以正在打字时
+                // Ctrl+C 照样退出、Ctrl+R 照样刷新，不会被输入框吃掉。
+                _ => {
+                    if let Some(text) = app.input.handle_key(code, modifiers)
+                        && send_tx.try_send(text.clone()).is_err()
+                    {
+                        // 队列满、或者发送端没起来（比如没配房间号）。界面永远不等发送端，
+                        // 但这条得说清楚没发出去，不然用户对着空气等回显。
+                        app.push_danmu(
+                            &DanmuMsg::system(format!("这条没发出去（发送端没起来）：{text}")),
+                            &cfg,
+                        );
+                    }
+                }
             }
         }
     }
@@ -202,8 +348,8 @@ fn draw(f: &mut Frame, app: &App, _cfg: &Config) {
     f.render_widget(info_panel(app), info);
     f.render_widget(viewers_panel(app), viewers);
     f.render_widget(danmaku_panel(app, right), right);
-    f.render_widget(stream_panel(app), status);
-    f.render_widget(input_panel(), input);
+    f.render_widget(stream_panel(app, status.width), status);
+    f.render_widget(input_panel(app), input);
 }
 
 fn banner() -> Paragraph<'static> {
@@ -292,34 +438,88 @@ fn danmaku_panel(app: &App, area: Rect) -> Paragraph<'static> {
     Paragraph::new(visible).block(Block::bordered().title(" 弹幕们 "))
 }
 
-fn stream_panel(app: &App) -> Paragraph<'static> {
-    let line = match app.room.as_ref() {
-        None => Line::from(Span::styled(
-            "○ 还没拿到房间状态",
+fn stream_panel(app: &App, width: u16) -> Paragraph<'static> {
+    // 左右边框各占一格，能放字的就是这么宽。
+    let inner = width.saturating_sub(2) as usize;
+    let parts: Vec<(String, Style)> = match app.room.as_ref() {
+        None => vec![(
+            "○ 还没拿到房间状态".to_string(),
             Style::default().fg(Color::DarkGray),
-        )),
+        )],
         Some(r) => match r.live_status {
             // 主播最关心「现在到底有没有在推流」，所以第一眼就是直播中 / 未开播。
-            1 => Line::from(vec![
-                Span::styled("● 直播中", Style::default().fg(Color::Green)),
-                Span::raw(format!("  已播 {}   在线 {}", r.live_duration, r.online)),
-            ]),
-            2 => Line::from(Span::styled(
-                "● 轮播中",
-                Style::default().fg(Color::Yellow),
-            )),
-            _ => Line::from(Span::styled("○ 未开播", Style::default().fg(Color::Gray))),
+            1 => vec![
+                ("● 直播中".to_string(), Style::default().fg(Color::Green)),
+                (format!("  已播 {}", r.live_duration), Style::default()),
+                (format!("   在线 {}", r.online), Style::default()),
+            ],
+            2 => vec![("● 轮播中".to_string(), Style::default().fg(Color::Yellow))],
+            _ => vec![("○ 未开播".to_string(), Style::default().fg(Color::Gray))],
         },
     };
-    Paragraph::new(line).block(Block::bordered().title(" obs 推流状态 "))
+    Paragraph::new(fit_parts(inner, parts)).block(Block::bordered().title(" obs 推流状态 "))
 }
 
-fn input_panel() -> Paragraph<'static> {
-    Paragraph::new(Line::from(Span::styled(
-        "这一版只读：发送、开播、OBS 都还没接",
-        Style::default().fg(Color::DarkGray),
-    )))
-    .block(Block::bordered().title(" 弹幕输入框 · Ctrl+R 刷新 / Ctrl+C 退出 "))
+/// 把若干「整段」的文本塞进 `inner` 格。
+///
+/// 之前是整行交给 ratatui 截，长时长会把后面的「在线 N」切成半个词 ——
+/// 「25天14时4分」那种真的出现过（屏上是「… 在」）。这里自己决定丢哪段：
+/// **整段一起丢**，只留一个「…」告诉用户后面还有，宁可少显示也别显示半句。
+fn fit_parts(inner: usize, parts: Vec<(String, Style)>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    let mut dropped = false;
+    for (i, (text, style)) in parts.into_iter().enumerate() {
+        let w = Span::raw(text.clone()).width();
+        // 第一段是状态本身（在播 / 未开播），哪怕格子再窄也得先摆上 ——
+        // 否则超窄终端下这一格会变成一片空白，什么信息都没有。
+        if i > 0 && used + w > inner {
+            dropped = true;
+            break;
+        }
+        used += w;
+        spans.push(Span::styled(text, style));
+    }
+    // 省略号自己也要占一格，塞不下就不放（不能为了它再挤掉一个字）。
+    if dropped && used < inner {
+        spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+    }
+    Line::from(spans)
+}
+
+fn input_panel(app: &App) -> Paragraph<'static> {
+    let input = &app.input;
+    let spans = if input.buf.is_empty() {
+        vec![Span::styled(
+            "在这里打字，回车发送",
+            Style::default().fg(Color::DarkGray),
+        )]
+    } else {
+        // 光标画成反色的那一格。不画出来根本看不出打字的落点 ——
+        // 进了 alternate screen 之后，终端自己的光标是不动的。
+        let cursor = input.cursor.min(input.buf.len());
+        let before: String = input.buf[..cursor].iter().collect();
+        let mut spans = vec![Span::raw(before)];
+        match input.buf.get(cursor) {
+            Some(at) => {
+                spans.push(Span::styled(
+                    at.to_string(),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
+                spans.push(Span::raw(input.buf[cursor + 1..].iter().collect::<String>()));
+            }
+            // 光标在最右边：用一个反色空格当光标
+            None => spans.push(Span::styled(
+                " ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            )),
+        }
+        spans
+    };
+    Paragraph::new(Line::from(spans))
+        .block(
+            Block::bordered().title(" 弹幕输入框 · 回车发送/↑↓ 历史/Ctrl+U 清空/Ctrl+C 退出 "),
+        )
 }
 
 #[cfg(test)]
@@ -476,4 +676,283 @@ mod tests {
         // 同一个人连着说两句：只有一条名字行 + 两条内容行
         assert_eq!(app.lines.len(), 3);
     }
+
+    /// 输入框的按键：插入 / 退格（中文按字符退）/ 左右移动 / 中途插入 / Ctrl+U 清空。
+    #[test]
+    fn input_edits_by_character() {
+        let mut input = Input::default();
+        for c in "中文ab".chars() {
+            input.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(input.text(), "中文ab");
+
+        // 退格退的是一个字（按字节存的话这里会剩半个「文」）
+        input.handle_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.text(), "中文a");
+        input.handle_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.text(), "中文");
+
+        // 左移两格，在「中」和「文」中间插一个字符
+        input.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        input.handle_key(KeyCode::Left, KeyModifiers::NONE);
+        input.handle_key(KeyCode::Char('X'), KeyModifiers::NONE);
+        assert_eq!(input.text(), "X中文");
+        assert_eq!(input.cursor, 1);
+
+        // 右移到头再按不越界
+        for _ in 0..10 {
+            input.handle_key(KeyCode::Right, KeyModifiers::NONE);
+        }
+        assert_eq!(input.cursor, input.buf.len());
+        input.handle_key(KeyCode::Char('!'), KeyModifiers::NONE);
+        assert_eq!(input.text(), "X中文!");
+
+        // 光标在最左边时退格不能做任何事（也不能 panic）
+        input.handle_key(KeyCode::Home, KeyModifiers::NONE);
+        input.handle_key(KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(input.text(), "X中文!");
+
+        // Delete 删的是光标右边那个
+        input.handle_key(KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(input.text(), "中文!");
+        input.handle_key(KeyCode::End, KeyModifiers::NONE);
+        input.handle_key(KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(input.text(), "中文!");
+
+        input.handle_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert_eq!(input.text(), "");
+        assert_eq!(input.cursor, 0);
+    }
+
+    /// Ctrl+C / Ctrl+R 是全局的：输入框不能把它们当文字收下（不然屏幕上会多出个 c），
+    /// 也不能因为带 Ctrl 就把输入框弄坏。
+    #[test]
+    fn input_never_swallows_the_global_keys() {
+        let mut input = Input::default();
+        for key in ['c', 'r'] {
+            let out = input.handle_key(KeyCode::Char(key), KeyModifiers::CONTROL);
+            assert!(out.is_none(), "Ctrl+{key} 不该产生发送");
+            assert_eq!(input.text(), "", "Ctrl+{key} 不能被当成普通字符插进去");
+        }
+    }
+
+    /// 回车：非空才发；空回车既不发也不进历史（否则历史里全是空行）。
+    #[test]
+    fn enter_only_sends_something_worth_sending() {
+        let mut input = Input::default();
+        assert_eq!(input.handle_key(KeyCode::Enter, KeyModifiers::NONE), None);
+        for c in "   ".chars() {
+            input.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(input.handle_key(KeyCode::Enter, KeyModifiers::NONE), None);
+        assert!(input.history.is_empty());
+        assert_eq!(input.text(), "", "空回车也要把输入框清干净");
+
+        for c in "你好".chars() {
+            input.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(
+            input.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+            Some("你好".to_string())
+        );
+        assert_eq!(input.history, vec!["你好".to_string()]);
+        assert_eq!(input.hist_idx, 1, "发完要回到「没在翻历史」的位置");
+    }
+
+    /// ↑↓ 翻最近 10 条：超过 10 条最旧的被挤掉，翻到头、翻到底都不能绕圈。
+    #[test]
+    fn history_keeps_the_last_ten_and_walks_both_ways() {
+        let mut input = Input::default();
+        for i in 1..=12 {
+            input.set_text(&format!("第{i}条"));
+            assert_eq!(
+                input.handle_key(KeyCode::Enter, KeyModifiers::NONE),
+                Some(format!("第{i}条"))
+            );
+        }
+        assert_eq!(input.history.len(), HISTORY_MAX);
+        assert_eq!(input.history.first().unwrap(), "第3条", "最旧的两条该被挤掉");
+        assert_eq!(input.history.last().unwrap(), "第12条");
+
+        // ↑ 先给最近发的那条
+        input.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(input.text(), "第12条");
+        // 一路翻到最旧，再按就停在那儿（不能绕回最新）
+        for _ in 0..(HISTORY_MAX + 5) {
+            input.handle_key(KeyCode::Up, KeyModifiers::NONE);
+        }
+        assert_eq!(input.text(), "第3条");
+
+        // ↓ 往回走一条，再翻到底就该清空
+        input.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(input.text(), "第4条");
+        for _ in 0..(HISTORY_MAX + 5) {
+            input.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        }
+        assert_eq!(input.text(), "");
+        assert_eq!(input.hist_idx, input.history.len());
+    }
+
+    /// 打进去的字要真的出现在屏幕上，清掉之后要回到占位提示。
+    #[test]
+    fn input_panel_shows_what_you_type() {
+        let cfg = Config::default();
+        let mut app = App::default();
+        let out = render(&app, &cfg, 150, 30);
+        assert!(flat(&out).contains(&flat("在这里打字")), "{out}");
+
+        for c in "在吗".chars() {
+            app.input.handle_key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        let out = render(&app, &cfg, 150, 30);
+        assert!(flat(&out).contains(&flat("在吗")), "{out}");
+        assert!(flat(&out).contains(&flat("回车发送")), "标题要写清楚怎么发");
+
+        app.input.handle_key(KeyCode::Char('u'), KeyModifiers::CONTROL);
+        let out = render(&app, &cfg, 150, 30);
+        assert!(flat(&out).contains(&flat("在这里打字")), "{out}");
+    }
+
+    /// 取一行里前 `width` 格的字（宽字符占两格），用来单独看某一个小格里的内容。
+    fn cell_text(line: &str, width: usize) -> String {
+        let mut used = 0;
+        let mut out = String::new();
+        for c in line.chars() {
+            let w = Span::raw(c.to_string()).width();
+            if used + w > width {
+                break;
+            }
+            used += w;
+            out.push(c);
+        }
+        out
+    }
+
+    /// obs 推流状态那格太窄时整段让位：宁可只留「● 直播中…」，
+    /// 也不能出现「已播 25天14」这种半截（6 号房那种长时长把「在线」截成过「在」）。
+    #[test]
+    fn stream_status_drops_whole_pieces_instead_of_cutting_words() {
+        let parts = || {
+            vec![
+                ("● 直播中".to_string(), Style::default().fg(Color::Green)),
+                ("  已播 25天14时4分".to_string(), Style::default()),
+                ("   在线 4321".to_string(), Style::default()),
+            ]
+        };
+        let text = |line: Line<'static>| line.to_string();
+
+        // 够宽：三段都在
+        let wide = text(fit_parts(80, parts()));
+        assert!(wide.contains("已播 25天14时4分"), "{wide}");
+        assert!(wide.contains("在线 4321"), "{wide}");
+
+        // 只装得下状态：时长整段丢，补一个省略号
+        let narrow = text(fit_parts(12, parts()));
+        assert!(narrow.contains("直播中"), "{narrow}");
+        assert!(!narrow.contains("已播"), "装不下就整段别放：{narrow}");
+        assert!(narrow.ends_with('…'), "{narrow}");
+
+        // 刚好装得下时长、装不下「在线」：时长得是完整的
+        let mid = text(fit_parts(27, parts()));
+        assert!(mid.contains("已播 25天14时4分"), "{mid}");
+        assert!(!mid.contains('在'), "{mid}");
+        assert!(mid.ends_with('…'), "{mid}");
+    }
+
+    /// 同一个 bug 走一遍真实渲染：底部那格只有整宽的 1/3。
+    #[test]
+    fn stream_panel_at_narrow_width_never_shows_half_a_word() {
+        let cfg = Config::default();
+        let mut app = App::default();
+        let mut room = RoomInfo::new(9527);
+        room.live_status = 1;
+        room.live_duration = "25天14时4分".to_string();
+        room.online = 4321;
+        app.room = Some(room);
+
+        let out = render(&app, &cfg, 60, 30);
+        // 缓冲区里宽字符会多占一格留下空格，找行和断言都得先 flat 掉空白。
+        let row = out
+            .lines()
+            .find(|l| flat(l).contains("直播中"))
+            .expect("状态那行");
+        // 底部左格就是前 20 格（连边框一起）
+        let cell = flat(&cell_text(row, 20));
+        assert!(cell.contains("直播中"), "{cell}");
+        assert!(cell.contains('…'), "装不下时长时要留个省略号：{cell}");
+        assert!(!cell.contains("已播") || cell.contains("分"), "{cell}");
+        assert!(!cell.contains('在') || cell.contains("在线"), "{cell}");
+    }
+
+    /// 一路走到底：打字 -> 回车 -> 发送端真的构造出 `/msg/send` 请求。
+    ///
+    /// 请求形状由 `api::send` 的测试钉住；这里只证明「回车确实把这条送出去了」，
+    /// 而不是把键盘事件吞在界面里。
+    #[tokio::test]
+    async fn enter_really_sends_the_typed_text() {
+        use crate::api::client::BiliClient;
+        use crate::api::send;
+        use crate::api::test_http;
+        use std::sync::Arc;
+
+        let srv = test_http::start(|r| {
+            if r.path.ends_with("web-interface/nav") {
+                return (200, nav_body());
+            }
+            (200, r#"{"code":0,"message":"0","data":{}}"#.to_string())
+        })
+        .await;
+        // nav 也指到假服务器：不然这条链路会去打真接口（单测必须纯离线）。
+        let client = Arc::new(
+            BiliClient::new("SESSDATA=abc; bili_jct=tok")
+                .unwrap()
+                .with_main_base(&srv.base),
+        );
+        let (send_tx, send_rx) = tokio::sync::mpsc::channel(4);
+        let (danmu_tx, mut danmu_rx) = tokio::sync::mpsc::channel(4);
+        let task = tokio::spawn(send::send_loop(
+            client,
+            srv.base.clone(),
+            9527,
+            send_rx,
+            danmu_tx,
+        ));
+
+        let mut app = App::default();
+        for c in "在吗".chars() {
+            assert!(
+                app.input
+                    .handle_key(KeyCode::Char(c), KeyModifiers::NONE)
+                    .is_none()
+            );
+        }
+        let outgoing = app.input.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(outgoing.as_deref(), Some("在吗"));
+        assert_eq!(app.input.text(), "", "发出去之后输入框要清干净");
+        send_tx.send(outgoing.unwrap()).await.unwrap();
+
+        let mut body = None;
+        for _ in 0..400 {
+            if let Some(h) = srv.hits().into_iter().find(|h| h.path == "/msg/send") {
+                body = Some(h.body);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let body = body.expect("回车之后该有一个 /msg/send 请求");
+        assert!(body.contains("msg=%E5%9C%A8%E5%90%97"), "{body}"); // 「在吗」
+        assert!(body.contains("roomid=9527"), "{body}");
+        assert!(danmu_rx.try_recv().is_err(), "发成功时不该塞系统弹幕");
+
+        task.abort();
+    }
+
+    /// nav 的假响应：两个 wbi key 只要够长就能签发（不是凭据，是每天轮换的公开种子）。
+    fn nav_body() -> String {
+        r#"{"code":0,"message":"0","data":{"mid":7,"wbi_img":{
+            "img_url":"https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png",
+            "sub_url":"https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png"}}}"#
+            .to_string()
+    }
 }
+

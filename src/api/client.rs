@@ -62,6 +62,14 @@ pub struct BiliClient {
     /// 而 TUI 一 panic 就是整屏消失、用户什么都看不到。所以这里先过滤 + 校验，
     /// 不合法就干脆不带 Cookie（退化成未登录，报错也只是几行系统弹幕）。
     cookie: Option<HeaderValue>,
+    /// Cookie 里的 `bili_jct`。发弹幕要把它同时填进表单的 `csrf` 和 `csrf_token`，
+    /// 接口只认这个，别去别处找（`SESSDATA` 是身份，`bili_jct` 才是防 CSRF 的令牌）。
+    csrf: Option<String>,
+    /// 主站（`api.bilibili.com`）的 base，nav 走它。
+    ///
+    /// 做成字段纯粹是为了测试：假服务器只能顶掉一个 base，
+    /// 而发送链路要先打 nav 拿 WBI 种子 —— 写死常量的话单测就会打真网络。
+    main_base: String,
     nav: Mutex<Option<Nav>>,
 }
 
@@ -74,10 +82,24 @@ impl BiliClient {
         Ok(Self {
             http,
             cookie: sanitize_cookie(cookie),
+            csrf: cookie_value(cookie, "bili_jct"),
+            main_base: MAIN_BASE.to_string(),
             nav: Mutex::new(None),
         })
     }
 
+    /// 让 nav 也走别的 base（只给测试用）。
+    #[cfg(test)]
+    pub fn with_main_base(mut self, base: &str) -> Self {
+        self.main_base = base.to_string();
+        self
+    }
+
+    /// 登录令牌。没登录（或配置里那串 Cookie 不全）时是 `None`，
+    /// 发送端据此在**发请求之前**就说清楚缺什么，而不是等一个含糊的 `-101`。
+    pub fn csrf(&self) -> Option<&str> {
+        self.csrf.as_deref()
+    }
 
     /// 发一次 GET，返回**整个**响应体（不判 code）。
     ///
@@ -112,14 +134,16 @@ impl BiliClient {
         unwrap(url, v)
     }
 
-    /// POST 表单。本轮全是「读」，没有任何地方调用它 —— 留着给下一轮的
-    /// 改标题 / 发弹幕用，接口形状和 Go 版一致（含 app 签名的 `sign` 字段）。
+    /// POST 表单，返回**整个**响应体（不判 code）。
+    ///
+    /// 写操作要自己看 `code`：发弹幕失败时接口给的那句 `message`
+    /// （「发送过于频繁」之类）是唯一能告诉用户「为什么没发出去」的东西，
+    /// 先被 `unwrap` 折成一句「返回 10030」就白丢了。
     ///
     /// 表单自己拼而不走 reqwest 的 `.form()`：那个方法要额外开 `form` feature，
     /// 而这里只有几个字段。`byte_serialize` 按 x-www-form-urlencoded 规则来
     /// （空格变 `+`、其余百分号编码），跟 Go 的 `url.Values.Encode()` 一致。
-    #[allow(dead_code)]
-    pub async fn post_form(&self, url: &str, form: &[(&str, String)]) -> Result<Value> {
+    pub async fn post_form_raw(&self, url: &str, form: &[(&str, String)]) -> Result<Value> {
         let body: String = form
             .iter()
             .map(|(k, v)| {
@@ -156,6 +180,14 @@ impl BiliClient {
                 truncate(&text, 200)
             )
         })?;
+        Ok(v)
+    }
+
+    /// POST 表单并拆掉 `{code,message,data}` 外壳，`code != 0` 一律转成错误。
+    /// 留给下一步的改标题 / 改封面用（发弹幕要看 message，走 `post_form_raw`）。
+    #[allow(dead_code)]
+    pub async fn post_form(&self, url: &str, form: &[(&str, String)]) -> Result<Value> {
+        let v = self.post_form_raw(url, form).await?;
         unwrap(url, v)
     }
 
@@ -168,7 +200,7 @@ impl BiliClient {
         }
 
         let body = self
-            .get_value(&format!("{MAIN_BASE}/x/web-interface/nav"))
+            .get_value(&format!("{}/x/web-interface/nav", self.main_base))
             .await?;
         let img = body["data"]["wbi_img"]["img_url"].as_str().unwrap_or("");
         let sub = body["data"]["wbi_img"]["sub_url"].as_str().unwrap_or("");
@@ -209,6 +241,21 @@ fn sanitize_cookie(raw: &str) -> Option<HeaderValue> {
         return None;
     }
     HeaderValue::from_str(&cleaned).ok()
+}
+
+/// 从 Cookie 串里抠一个键的值（发弹幕要 `bili_jct`）。
+///
+/// 先过一遍控制字符过滤：用户从浏览器 DevTools 里抄 Cookie 时经常连换行一起复制进来，
+/// 这个值会被塞进**请求体**（`csrf=`），带着 `\r` 发出去服务端会认不出来，
+/// 报的还是一句含糊的「csrf 校验失败」。
+pub fn cookie_value(cookie: &str, name: &str) -> Option<String> {
+    let cleaned: String = cookie.chars().filter(|c| !c.is_control()).collect();
+    cleaned
+        .split(';')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| k.trim() == name)
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// 接口有时把数字给成字符串（老接口尤其爱这么干），两种都收。
@@ -262,6 +309,27 @@ mod tests {
         assert!(sanitize_cookie("").is_none());
         assert!(sanitize_cookie("   ").is_none());
         assert!(sanitize_cookie("SESSDATA=a; bili_jct=b").is_some());
+    }
+
+    /// 发弹幕的 csrf 只能来自 cookie 里的 bili_jct：取不到就得当场说「没登录」，
+    /// 不能拿空串去发（服务端只会回一句含糊的 -111）。
+    #[test]
+    fn csrf_comes_from_bili_jct() {
+        let c = BiliClient::new("SESSDATA=abc; bili_jct=tok123; DedeUserID=7").unwrap();
+        assert_eq!(c.csrf(), Some("tok123"));
+
+        // 名字对不上 / 没有这个键 / 值是空的，一律算没登录
+        assert!(BiliClient::new("SESSDATA=abc").unwrap().csrf().is_none());
+        assert!(BiliClient::new("bili_jct2=nope").unwrap().csrf().is_none());
+        assert!(BiliClient::new("bili_jct=").unwrap().csrf().is_none());
+        assert!(BiliClient::new("").unwrap().csrf().is_none());
+    }
+
+    /// 值里混进换行时要清掉：它会被拼进请求体，带 `\r` 发出去服务端认不出来。
+    #[test]
+    fn cookie_value_strips_control_chars() {
+        assert_eq!(cookie_value("a=1; bili_jct=x\r\ny; c=2", "bili_jct").as_deref(), Some("xy"));
+        assert_eq!(cookie_value("  bili_jct = spaced  ", "bili_jct").as_deref(), Some("spaced"));
     }
 
     /// 配置里的 Cookie 脏了只能退化成「没登录」，绝不能让整个 TUI 崩掉：
