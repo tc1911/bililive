@@ -88,6 +88,11 @@ pub struct Wiring {
     pub live: Sender<LiveRequest>,
     /// 开播任务 -> 界面
     pub live_events: Receiver<LiveEvent>,
+    /// 开播任务 -> 界面：OBS 联动那件事的结果（一行字，摆在推流码栏末尾）。
+    ///
+    /// 单开一条通道、**不并进 `LiveEvent`**：它不是开播的结果，只是顺手多做的事，
+    /// 晚几秒到也不能反过来把「已开播」改成别的。
+    pub obs_notes: Receiver<String>,
 }
 
 fn setup() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
@@ -333,6 +338,7 @@ async fn event_loop(
         info_events: mut info_rx,
         live: live_tx,
         live_events: mut live_rx,
+        obs_notes: mut obs_rx,
     } = w;
     let mut app = App::default();
     // 配置里记着的开播分区得先进界面：分区树要等分区表回来才建，而「展开哪个父分区、
@@ -362,6 +368,10 @@ async fn event_loop(
         }
         while let Ok(ev) = live_rx.try_recv() {
             app.control.on_live_event(ev);
+        }
+        // OBS 那件事在另一条任务上跑，结果可能晚几秒才来；来一条记一条。
+        while let Ok(note) = obs_rx.try_recv() {
+            app.control.on_obs_note(note);
         }
 
         terminal.draw(|f| draw(f, &app, &cfg))?;

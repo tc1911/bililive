@@ -263,6 +263,9 @@ pub struct Control {
     live: LiveQuery,
     /// 开播成功拿到的各路推流凭据。下播成功后清掉。
     streams: Vec<Stream>,
+    /// OBS 联动那件事的结果（填好了 / 没填上的原话），摆在推流码栏末尾。
+    /// 空 = 还没发生（关掉了联动、还没开播、或者那条任务还没回话）。
+    obs_note: String,
     /// 开播确认层开着的时候是 `Some`
     confirm: Option<ConfirmStart>,
     /// 开播 / 下播请求还在路上。这期间不再发第二次（连按 F4/F5 只会被顶栏那句话挡住）
@@ -293,6 +296,7 @@ impl Default for Control {
             saved_area_name: String::new(),
             live: LiveQuery::Idle,
             streams: Vec::new(),
+            obs_note: String::new(),
             confirm: None,
             start_pending: false,
             stop_pending: false,
@@ -467,6 +471,14 @@ impl Control {
         self.set_message(format!("{what}请求没送出去（开播任务正忙），再按一次试试"));
     }
 
+    /// OBS 联动那条链回来的那行字（填好了 / 没填上的原话）。
+    ///
+    /// 它**只**往推流码栏末尾加一行：开播的成败早就由 `LiveEvent::Started` 定过了，
+    /// 这条消息晚几秒到，绝不能反过来把「已开播」改写成失败。
+    pub fn on_obs_note(&mut self, text: impl Into<String>) {
+        self.obs_note = text.into().replace('\n', " ");
+    }
+
     /// 把一段地址画进账号栏。登录二维码和开播验证码共用这一套渲染
     /// （半格字符 + 真彩色在 `ui/qr.rs`，别在别处再拼一遍）。
     fn show_qr(&mut self, content: &str, title: &str) {
@@ -505,6 +517,9 @@ impl Control {
                 self.stop_pending = false;
                 self.live = LiveQuery::Known(1);
                 self.streams = streams;
+                // 换了一场直播，上一场 OBS 填没填上那句话就不再是这一场的了
+                //（开播那条任务过几秒还会再送一条新的过来）。
+                self.obs_note.clear();
                 // 开播成功自动切到推流码栏（Go 版就这么做的）：开完播人最想看的就是
                 // 服务器和密钥，别让他再自己按一次 Tab。
                 self.tab = Tab::Stream;
@@ -541,6 +556,7 @@ impl Control {
                 self.live = LiveQuery::Known(0);
                 // 下播了，凭据就没用了（服务端下一次开播会换一组），清掉。
                 self.streams.clear();
+                self.obs_note.clear();
                 self.set_message("已下播，推流码已清掉");
             }
             LiveEvent::Failed { action, message } => {
@@ -1267,7 +1283,7 @@ fn draw_account(f: &mut Frame, c: &Control, area: Rect) {
 /// 终端太窄时密钥尾部会被切掉，这是认了的取舍：折行会把一串密钥断成两行，更难复制。
 fn draw_stream(f: &mut Frame, c: &Control, area: Rect) {
     if !c.streams.is_empty() {
-        f.render_widget(Paragraph::new(stream_lines(&c.streams)), area);
+        f.render_widget(Paragraph::new(stream_lines(&c.streams, &c.obs_note)), area);
         return;
     }
     let lines: Vec<Line<'static>> = match &c.live {
@@ -1310,7 +1326,10 @@ fn draw_stream(f: &mut Frame, c: &Control, area: Rect) {
 
 /// 一路凭据几行字：类型 / 服务器 / 密钥 / 完整 URL。
 /// 每个值**单独占一行**，就是为了让人能整行选中复制。
-fn stream_lines(streams: &[Stream]) -> Vec<Line<'static>> {
+///
+/// `obs_note` 非空时（OBS 联动那件事回话了）在最末尾多一行 —— 就是「多一行字」，
+/// 不占凭据的位置，也不改上面那几行的样子。
+fn stream_lines(streams: &[Stream], obs_note: &str) -> Vec<Line<'static>> {
     let label = |text: &'static str| {
         Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
     };
@@ -1342,6 +1361,12 @@ fn stream_lines(streams: &[Stream]) -> Vec<Line<'static>> {
         "直播间已对外可见；下播按 F5",
         Style::default().fg(Color::DarkGray),
     )));
+    if !obs_note.is_empty() {
+        lines.push(Line::from(Span::styled(
+            obs_note.to_string(),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     lines
 }
 
@@ -2622,6 +2647,36 @@ mod tests {
         let text = text_of(&c, 160, 40);
         assert!(text.contains("还没开播"), "{text}");
         assert!(!text.contains("rtmp-1"), "推流码不该还留在屏幕上：{text}");
+    }
+
+    /// OBS 联动那行字只往推流码栏末尾加，**绝不**改顶栏那句「已开播」——
+    /// 它是另一条任务晚几秒送回来的，要是能改开播的结论，就等于「顺手填个 OBS
+    /// 把开播成功说成失败」。
+    #[test]
+    fn the_obs_note_only_adds_a_line_to_the_stream_tab() {
+        let mut c = live_control();
+        c.on_live_event(LiveEvent::Started(vec![stream()]));
+        assert_eq!(c.message, "已开播");
+
+        c.on_obs_note("OBS：已把推流地址与密钥填进「设置 → 推流」，开始推流还是你自己按");
+        assert_eq!(c.message, "已开播", "OBS 那行字不许动开播那句结论");
+        let text = text_of(&c, 160, 48);
+        assert!(text.contains("OBS：已把推流地址与密钥填进"), "{text}");
+        assert!(text.contains("rtmp-1"), "凭据还得在：{text}");
+
+        // 没填上也只是多一行字，凭据照样摆着
+        c.on_obs_note("OBS 没填上：连不上 OBS 的 WebSocket");
+        let text = text_of(&c, 160, 48);
+        assert!(text.contains("OBS没填上"), "{text}");
+        assert!(text.contains("rtmp-1"), "{text}");
+        assert!(text.contains("已开播") || text.contains("直播间已对外可见"), "{text}");
+
+        // 换一场直播：上一场那行字就不该还挂着
+        c.on_live_event(LiveEvent::Stopped);
+        c.on_live_event(LiveEvent::Started(vec![stream()]));
+        let text = text_of(&c, 160, 48);
+        assert!(!text.contains("OBS没填上"), "上一场的话不许留到这一场：{text}");
+        assert!(!text.contains("OBS：已把"), "{text}");
     }
 
     /// 两种验证都画到**账号栏**、都说「扫完再按 F4」，**不是**「开播失败」。

@@ -5,6 +5,7 @@
 mod api;
 mod cli;
 mod config;
+mod obs;
 mod timefmt;
 mod ui;
 
@@ -66,6 +67,9 @@ async fn main() -> Result<()> {
     // 事件容量给小一点 —— 里面装着推流凭据（几百字节），用不着排队。
     let (live_tx, live_rx) = mpsc::channel::<LiveRequest>(4);
     let (live_evt_tx, live_evt_rx) = mpsc::channel::<LiveEvent>(8);
+    // OBS 联动那条：开播任务 -> 界面，只有一行字（填好了 / 没填上的原话）。
+    // 容量 4 够用：开播那一下最多来一条，它还比 `LiveEvent::Started` 晚几秒。
+    let (obs_note_tx, obs_note_rx) = mpsc::channel::<String>(4);
     // 登录任务 -> 会话任务：拼好的 Cookie 串。
     let (creds_tx, creds_rx) = mpsc::channel::<String>(1);
     // 「凭据换过了」的信号。watch 里那个数本身没用，变一下就是信号 ——
@@ -111,6 +115,15 @@ async fn main() -> Result<()> {
         LIVE_BASE.to_string(),
         cfg.room_id,
         refresh_tx.clone(),
+        ObsFill {
+            cfg: obs::Config {
+                fill: cfg.obs_fill,
+                host: cfg.obs_host.clone(),
+                port: cfg.obs_port,
+                password: cfg.obs_password.clone(),
+            },
+            notes: obs_note_tx,
+        },
         live_rx,
         live_evt_tx,
     ));
@@ -162,6 +175,7 @@ async fn main() -> Result<()> {
             info_events: info_evt_rx,
             live: live_tx,
             live_events: live_evt_rx,
+            obs_notes: obs_note_rx,
         },
     )
     .await
@@ -315,11 +329,15 @@ async fn info_task(
 ///
 /// 写操作（开播 / 下播）用的房间号必须是 `get_info` 回的**规范号**：配置里那个可能是短号，
 /// 短号也查得到，但写操作拿规范号更稳（上一轮已经证实这俩不是一个数）。
+///
+/// 开播成功后还会顺手做一件跟 B 站无关的事：把推流凭据填进 OBS（`obs_fill` 那一包），
+/// 见 `spawn_obs_fill`。
 async fn live_task(
     client: Arc<BiliClient>,
     base: String,
     room_id: i64,
     refresh: mpsc::Sender<()>,
+    obs_fill: ObsFill,
     mut req: mpsc::Receiver<LiveRequest>,
     evt: mpsc::Sender<LiveEvent>,
 ) {
@@ -360,6 +378,10 @@ async fn live_task(
                         // 主页那格「obs 推流状态」也走这条只读链，顺手让它重拉一次，
                         // 别让人对着一句「未开播」等满 30 秒。
                         api::room::refresh(&refresh);
+                        // OBS 那件事**甩到另一条任务上**（见 `spawn_obs_fill`）：
+                        // 它要连网络、还可能等到超时，挡在这儿就等于「OBS 没开机时
+                        // 开播成功也要多等几秒才显示出来」。
+                        spawn_obs_fill(&obs_fill.cfg, &streams, &obs_fill.notes);
                         LiveEvent::Started(streams)
                     }
                     Ok(api::live::StartOutcome::Verify { kind, url, message }) => {
@@ -403,6 +425,48 @@ async fn live_task(
             return; // 界面没了
         }
     }
+}
+
+/// 开播成功后顺手要做的 OBS 那一件事：开关 + 连哪儿 + 把结果写成一行字的那条通道。
+///
+/// 打成一个包只是因为 `live_task` 的参数已经够多了（一个个摆出来还得两头对顺序）。
+struct ObsFill {
+    cfg: obs::Config,
+    notes: mpsc::Sender<String>,
+}
+
+/// 开播成功后把推流凭据填进 OBS 的「设置 → 推流」。**只管填，不管推**：
+/// 填完绝不代按「开始推流」，那一下得用户自己在 OBS 里按。
+///
+/// 另起一条任务：连 OBS 可能要等到超时，挡在开播那条链上就等于「OBS 没开机时，
+/// 开播成功也要多等几秒才显示出来」。结果只变成 `notes` 里的一行字
+///（界面把它摆在推流码栏末尾），**绝不回头改这次开播的成败**。
+fn spawn_obs_fill(
+    obs_cfg: &obs::Config,
+    streams: &[api::live::Stream],
+    notes: &mpsc::Sender<String>,
+) {
+    if !obs_cfg.fill {
+        return;
+    }
+    // **第一路 rtmp**：OBS 的「设置 → 推流」只吃 rtmp，srt 那几路填进去它也不认
+    //（B 站给的主推流就是 `rtmp` 那一组，协议字段在 `api::live::Stream::protocol`）。
+    let Some(s) = streams.iter().find(|s| s.protocol == "rtmp") else {
+        let _ = notes.try_send("OBS 没填上：这次开播没给 rtmp 推流地址".to_string());
+        return;
+    };
+    let cfg = obs_cfg.clone();
+    // 服务器和密钥原样搬过去：`key` 里自带 `?streamname=…`，谁都不许在这儿拼一遍
+    //（拼错的表现是 OBS 里一按「开始推流」就断，而界面上看不出任何异常）。
+    let (server, key) = (s.address.clone(), s.key.clone());
+    let notes = notes.clone();
+    tokio::spawn(async move {
+        let text = match obs::fill(&cfg, &server, &key).await {
+            Ok(()) => "OBS：已把推流地址与密钥填进「设置 → 推流」，开始推流还是你自己按".to_string(),
+            Err(e) => format!("OBS 没填上：{e}"),
+        };
+        let _ = notes.send(text).await;
+    });
 }
 
 /// 拿写操作要用的**规范房间号**，顺手把 `get_info` 一起查了。
@@ -530,6 +594,7 @@ mod tests {
     use super::*;
     use api::test_http::{self, Request};
     use std::collections::HashMap;
+    use std::time::Duration;
 
     /// 表单体解成键值对（跟 `api::info::tests` 里那个同一个口径）。
     fn form_of(body: &str) -> HashMap<String, String> {
@@ -900,16 +965,22 @@ mod tests {
 
     // ------------------------------------------------------- 开播那条链
 
-    /// 拉起开播那条链，返回（请求发送端、事件接收端、那条「重刷房间信息」的信号）。
-    fn spawn_live_task(
-        base: &str,
-        room_id: i64,
-    ) -> (
+    /// 拉起开播那条链之后手上那几样东西。给个名字只是因为元组长得 clippy 不乐意。
+    type LiveHarness = (
         mpsc::Sender<LiveRequest>,
         mpsc::Receiver<LiveEvent>,
         mpsc::Receiver<()>,
+        mpsc::Receiver<String>,
         tokio::task::JoinHandle<()>,
-    ) {
+    );
+
+    /// 拉起开播那条链，返回（请求发送端、事件接收端、那条「重刷房间信息」的信号、
+    /// OBS 那行字的接收端、任务句柄）。
+    fn spawn_live_task(
+        base: &str,
+        room_id: i64,
+        obs: obs::Config,
+    ) -> LiveHarness {
         // nav 也顶到假服务器：人脸认证那条路要拿 mid 拼地址
         //（这是唯一会顺手问 nav 的地方，不然单测会打真网络）。
         let client = Arc::new(
@@ -920,15 +991,20 @@ mod tests {
         let (tx, rx) = mpsc::channel::<LiveRequest>(4);
         let (evt_tx, evt_rx) = mpsc::channel::<LiveEvent>(8);
         let (refresh_tx, refresh_rx) = mpsc::channel::<()>(1);
+        let (note_tx, note_rx) = mpsc::channel::<String>(4);
         let task = tokio::spawn(live_task(
             client,
             base.to_string(),
             room_id,
             refresh_tx,
+            ObsFill {
+                cfg: obs,
+                notes: note_tx,
+            },
             rx,
             evt_tx,
         ));
-        (tx, evt_rx, refresh_rx, task)
+        (tx, evt_rx, refresh_rx, note_rx, task)
     }
 
     /// 开播整条打一遍：先 `get_info` 拿规范房间号，再版本号，再 startLive。
@@ -962,7 +1038,7 @@ mod tests {
         })
         .await;
 
-        let (tx, mut rx, mut refresh, task) = spawn_live_task(&srv.base, 6);
+        let (tx, mut rx, mut refresh, _notes, task) = spawn_live_task(&srv.base, 6, obs::Config::default());
         tx.send(LiveRequest::Start { area_v2: 371 }).await.unwrap();
         let ev = rx.recv().await.unwrap();
         let LiveEvent::Started(streams) = ev else {
@@ -1020,7 +1096,7 @@ mod tests {
         })
         .await;
 
-        let (tx, mut rx, mut refresh, task) = spawn_live_task(&srv.base, 6);
+        let (tx, mut rx, mut refresh, _notes, task) = spawn_live_task(&srv.base, 6, obs::Config::default());
         tx.send(LiveRequest::Stop).await.unwrap();
         assert_eq!(rx.recv().await.unwrap(), LiveEvent::Stopped);
 
@@ -1068,7 +1144,7 @@ mod tests {
         })
         .await;
 
-        let (tx, mut rx, _refresh, task) = spawn_live_task(&srv.base, 6);
+        let (tx, mut rx, _refresh, _notes, task) = spawn_live_task(&srv.base, 6, obs::Config::default());
         tx.send(LiveRequest::LoadStatus).await.unwrap();
         assert_eq!(
             rx.recv().await.unwrap(),
@@ -1090,7 +1166,7 @@ mod tests {
     #[tokio::test]
     async fn live_task_without_a_room_never_hits_the_network() {
         let srv = test_http::start(|_| (200, r#"{"code":0,"message":"0"}"#.to_string())).await;
-        let (tx, mut rx, _refresh, task) = spawn_live_task(&srv.base, 0);
+        let (tx, mut rx, _refresh, _notes, task) = spawn_live_task(&srv.base, 0, obs::Config::default());
 
         tx.send(LiveRequest::LoadStatus).await.unwrap();
         let LiveEvent::Failed { action, message } = rx.recv().await.unwrap() else {
@@ -1112,6 +1188,172 @@ mod tests {
         assert_eq!(action, LiveAction::Stop);
 
         assert!(srv.hits().is_empty(), "一个请求都不该发出去");
+        task.abort();
+    }
+
+    // ------------------------------------------------------- OBS 联动
+
+    /// 一条「开播必成」的假 B 站：`rtmp` 一组 + `protocols` 里再来一路 srt。
+    /// OBS 那件事要拿**第一路 rtmp**，多给一路 srt 才好验「没抓错」。
+    async fn bili_that_starts_live() -> test_http::FakeServer {
+        test_http::start(|r: &Request| match r.path.as_str() {
+            "/room/v1/Room/get_info" => (
+                200,
+                r#"{"code":0,"message":"0","data":{"room_id":7734200,"uid":42,
+                    "title":"t","live_status":0,"live_time":"0000-00-00 00:00:00",
+                    "user_cover":""}}"#
+                    .to_string(),
+            ),
+            api::live::LIVE_VERSION_PATH => (
+                200,
+                r#"{"code":0,"message":"0","data":{"curr_version":"9.9.9","build":12345}}"#
+                    .to_string(),
+            ),
+            api::live::START_LIVE_PATH => (
+                200,
+                r#"{"code":0,"message":"0","data":{
+                    "rtmp":{"addr":"rtmp://a/live","code":"?streamname=s1&key=k1"},
+                    "protocols":[{"protocol":"srt","addr":"srt://b:1935","code":"?s=2"}]}}"#
+                    .to_string(),
+            ),
+            other => (
+                200,
+                format!(r#"{{"code":-1,"message":"不认识的路径 {other}"}}"#),
+            ),
+        })
+        .await
+    }
+
+    /// 开播成功 → 顺手把**第一路 rtmp**填进 OBS。这条要整条走通：填错那一路
+    /// （比如把 srt 塞进去）或者密钥被拼过一遍，都只会在真机上才看得出来。
+    #[tokio::test]
+    async fn a_successful_start_fills_obs_with_the_rtmp_stream() {
+        let srv = bili_that_starts_live().await;
+        let mut fake = obs::tests::fake_obs(
+            None,
+            serde_json::json!({
+                "requestType": "SetStreamServiceSettings",
+                "requestStatus": { "result": true, "code": 100 }
+            }),
+            true,
+        )
+        .await;
+        let cfg = obs::Config {
+            fill: true,
+            host: "127.0.0.1".into(),
+            port: fake.port,
+            password: String::new(),
+        };
+
+        let (tx, mut rx, _refresh, mut notes, task) =
+            spawn_live_task(&srv.base, 6, cfg);
+        tx.send(LiveRequest::Start { area_v2: 371 }).await.unwrap();
+        let LiveEvent::Started(streams) = rx.recv().await.unwrap() else {
+            panic!("该是开播成功");
+        };
+        assert_eq!(streams[0].protocol, "rtmp");
+
+        // 那一行字得回来（OBS 那条链是另一条任务，慢一点）
+        let note = tokio::time::timeout(Duration::from_secs(3), notes.recv())
+            .await
+            .expect("OBS 的结果该回来")
+            .expect("通道还在");
+        assert!(note.contains("设置 → 推流"), "填好了要说清楚填哪儿：{note}");
+        assert!(
+            note.contains("你自己按"),
+            "绝不能说成「已经开推」—— 推流那下得用户自己按：{note}"
+        );
+
+        // 假 OBS 真收到的那条 Request：服务器 / 密钥就是第一路 rtmp 的那一份
+        let mut got = None;
+        while let Ok(Some((op, d))) =
+            tokio::time::timeout(Duration::from_secs(2), fake.frames.recv()).await
+        {
+            if op == 6 {
+                got = Some(d);
+                break;
+            }
+        }
+        let d = got.expect("假 OBS 该收到一条 Request");
+        assert_eq!(d["requestType"], "SetStreamServiceSettings");
+        assert_eq!(d["requestData"]["streamServiceType"], "rtmp_custom");
+        assert_eq!(
+            d["requestData"]["streamServiceSettings"]["server"],
+            "rtmp://a/live"
+        );
+        assert_eq!(
+            d["requestData"]["streamServiceSettings"]["key"],
+            "?streamname=s1&key=k1",
+            "密钥要原样过去，谁都不许再拼一遍"
+        );
+
+        task.abort();
+        fake.task.abort();
+    }
+
+    /// `obs_fill = false`：开播照旧，但一个字都不多说（也不去连任何东西）。
+    #[tokio::test]
+    async fn obs_fill_off_means_no_note_and_no_connection() {
+        let srv = bili_that_starts_live().await;
+        // 端口写 1：真去连的话会立刻被拒（连上还会多花时间），关掉就该碰都不碰
+        let cfg = obs::Config {
+            fill: false,
+            host: "127.0.0.1".into(),
+            port: 1,
+            password: String::new(),
+        };
+        let (tx, mut rx, _refresh, mut notes, task) = spawn_live_task(&srv.base, 6, cfg);
+        tx.send(LiveRequest::Start { area_v2: 371 }).await.unwrap();
+        let _ = rx.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            notes.try_recv().is_err(),
+            "关掉联动就不该有任何 OBS 的字"
+        );
+        task.abort();
+    }
+
+    /// 这次开播只给了 srt（没有 rtmp）：填不进 OBS 也得**只多一行字**，
+    /// 而且连都不去连（没什么可填的）。
+    #[tokio::test]
+    async fn a_start_without_an_rtmp_stream_just_says_so() {
+        let srv = test_http::start(|r: &Request| match r.path.as_str() {
+            "/room/v1/Room/get_info" => (
+                200,
+                r#"{"code":0,"message":"0","data":{"room_id":7734200,"uid":42,
+                    "title":"t","live_status":0,"live_time":"0000-00-00 00:00:00",
+                    "user_cover":""}}"#
+                    .to_string(),
+            ),
+            api::live::LIVE_VERSION_PATH => (
+                200,
+                r#"{"code":0,"message":"0","data":{"curr_version":"9.9.9","build":1}}"#
+                    .to_string(),
+            ),
+            api::live::START_LIVE_PATH => (
+                200,
+                r#"{"code":0,"message":"0","data":{
+                    "protocols":[{"protocol":"srt","addr":"srt://b:1935","code":"?s=2"}]}}"#
+                    .to_string(),
+            ),
+            other => (
+                200,
+                format!(r#"{{"code":-1,"message":"不认识的路径 {other}"}}"#),
+            ),
+        })
+        .await;
+        let cfg = obs::Config {
+            fill: true,
+            host: "127.0.0.1".into(),
+            port: 1,
+            password: String::new(),
+        };
+        let (tx, mut rx, _refresh, mut notes, task) = spawn_live_task(&srv.base, 6, cfg);
+        tx.send(LiveRequest::Start { area_v2: 371 }).await.unwrap();
+        assert!(matches!(rx.recv().await.unwrap(), LiveEvent::Started(_)));
+        let note = notes.recv().await.expect("该说一句没 rtmp");
+        assert!(note.contains("没有") || note.contains("没给"), "{note}");
+        assert!(note.contains("rtmp"), "{note}");
         task.abort();
     }
 }

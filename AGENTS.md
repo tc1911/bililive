@@ -8,12 +8,17 @@
 参照物是本机的 Go 版 `../bilibili_live_tui+`（读它的代码摸行为，**不抄代码**，
 也**不要改那个仓库**）。两边共用同一份账号思路，但配置文件和字段名是不同的两套。
 
-**当前进度：读 + 发弹幕 + 扫码登录 + 选分区 + 改标题 / 换封面** —— 看弹幕、看房间信息、
-看观众榜，底部输入框能打字、回车发弹幕（超 20 字自动切段连发）；
-第二页（配置页）能翻了，账号栏能扫码登录并把 cookie 写回配置，
+**当前进度：读 + 发弹幕 + 扫码登录 + 选分区 + 改标题 / 换封面 + 开播 / 下播 /
+推流码 + OBS 联动** —— 看弹幕、看房间信息、看观众榜，底部输入框能打字、回车发弹幕
+（超 20 字自动切段连发）；第二页（配置页）能翻了，账号栏能扫码登录并把 cookie 写回配置，
 分区栏是一棵真分区树（拉分区表 / 选分区 / 只把 area_id + area_name 写回配置），
-直播间信息栏能改标题、换封面（本地图先传 B 站图床），下半格还画当前封面。
-**开播 / 下播 / 推流码 / OBS 联动一行都还没写**（appkey 那套签名也没接）。
+直播间信息栏能改标题、换封面（本地图先传 B 站图床）、下半格画当前封面；
+`F4` 开播（先过确认层）/ `F5` 下播，推流码栏摆服务器 / 密钥 / 完整 URL，
+开播成功后通过 obs-websocket 把第一路 rtmp 填进 OBS 的「设置 → 推流」
+（**只管填，绝不代按「开始推流」**，见第 16 条）。
+
+**还没在真账号上验过的**：`startLive` / `stopLive`（AI 一律不许真开播）、
+app 签名只有假服务器覆盖、OBS 联动一次都没连过真 OBS。
 
 ## 常用命令
 
@@ -62,6 +67,9 @@ main.rs          出入口：读配置 -> 建 client -> 起后台任务（弹幕
                  扫码登录 / 会话落盘）-> ui::run；登录后重启弹幕链路也在这儿
 config.rs        config.toml 读写
 timefmt.rs       时间：本地 HH:MM、已播时长、「北京时间的墙上时间」还原（纯函数为主）
+obs.rs           OBS 联动：obs-websocket 5.x 的 JSON 客户端（Hello/Identify/Identified/
+                 Request/Response）+ 鉴权（黄金值钉住）+ Resolve（补端口 / 密码）。
+                 **不是 B 站的接口**，所以不塞 `api/`；只管填配置，不管推流
 api/
   area.rs        分区表（两级一次拿回来）+ 与界面之间那两条消息类型
   appsign.rs     直播姬那套 **app 签名**（appkey/appsec + Go 口径的表单编码），开播 / 下播用
@@ -116,6 +124,8 @@ main::live_task      --(api::live::start_live)-------> api.live.bilibili.com/roo
 main::live_task      --(api::live::stop_live)--------> api.live.bilibili.com/room/v1/Room/stopLive（不带签名）
 main::live_task      --(mpsc<LiveEvent>, 容量 8)----> ui 的配置页（状态 / 推流码 / 验证码 / 提示）
 main::live_task      --(mpsc<()>)------------------> room::sync_loop（开播 / 下播后立刻重拉状态）
+main::spawn_obs_fill --(obs::fill)-----------------> OBS 的 WebSocket（默认 ws://127.0.0.1:4455/）
+main::spawn_obs_fill --(mpsc<String>, 容量 4)------> ui 的配置页（推流码栏末尾那一行字）
 ```
 
 **写在两个地方的东西只有两个**：`login_loop` 只跟接口说话（不碰磁盘、不碰界面），
@@ -126,6 +136,8 @@ main::live_task      --(mpsc<()>)------------------> room::sync_loop（开播 / 
 这个**顺序**的落点（界面不许自己发请求，所以三条请求都从 `mpsc<InfoRequest>` 进去）。
 开播那条也一样：`api/live.rs` 只管接口（含 60024 / 60043 的分诊和推流凭据组装），
 `main::live_task` 才是「先 `get_info` 拿规范房间号、再开播 / 下播」这个**顺序**的落点。
+OBS 那条是**唯一一条不跟 B 站说话**的链路：`obs.rs` 只管协议和「连哪儿 / 拿什么密码」，
+`main::spawn_obs_fill` 才是「开播成了才填、填的结果只变成一行字」的落点。
 
 ## 硬约束（改代码前必读）
 
@@ -531,6 +543,80 @@ build=<版本接口的 build>  ts=<毫秒>
   窄终端下密钥尾部会被截断，这是认了的取舍 —— 折行会把一串密钥断成两行，更难复制。
 - 三种失败都只写顶栏那一行 / 推流码那一栏，**绝不 panic、绝不退出**。
 
+### 16. OBS 联动（只管填，不管推）
+
+开播（F4）**成功**之后，把第一路 rtmp 的服务器 + 密钥通过
+[obs-websocket](https://github.com/obsproject/obs-websocket) 5.x 写进 OBS 的
+「设置 → 推流」，省得手抄那串近百字符的密钥。代码在 `src/obs.rs`（不是 B 站接口，
+别塞 `api/`），接进 `main::live_task` 的 `Started` 分支。
+
+**协议**（一条 JSON 连接走完，操作码就是 `op` 字段）：
+
+```text
+Hello(op 0) -> Identify(op 1) -> Identified(op 2) -> Request(op 6) -> Response(op 7)
+```
+
+- 要鉴权时 `Hello.d.authentication{challenge, salt}`，`Identify.d.authentication` 填应答；
+  Hello 里**没有** `authentication` 就**不许**带这个字段（凭空塞一个串 = 鉴权失败）。
+- 鉴权公式（`obs::auth_string`，分两步、中间那串 base64 是下一步的输入）：
+
+  ```text
+  secret = base64(sha256(password + salt))
+  auth   = base64(sha256(secret + challenge))
+  ```
+
+  **黄金值**（python 独立算的，钉在 `obs.rs` 的测试里；换算法或写错一步它就会红）：
+  password `secret` + salt `salt123` + challenge `chal456`
+  → `yo3DuCXyQQheiGKNZpyXB//3OodP2GoXULXeX19lE4M=`
+- 要发的就是一条 `SetStreamServiceSettings`：
+
+  ```json
+  {"streamServiceType":"rtmp_custom",
+   "streamServiceSettings":{"server":"<地址>","key":"<密钥>","use_auth":false}}
+  ```
+
+  服务类型必须是 `rtmp_custom`：B 站给的密钥自带 `?streamname=…`，**整串原样**塞进
+  `key`，让 OBS 自己去拼。谁都不许在这儿「顺手」拼地址或转义 ——
+  拼错的表现是 OBS 里一按「开始推流」就断，而界面上什么异常都看不出来。
+- `requestStatus.result = false` 是**失败**，不是成功：收着回话就说「填好了」的话，
+  用户会在 OBS 里对着一份没换过的密钥纳闷。
+- 等 `Response` 的时候可能先来一条事件（`op 5`）：跳过它接着等，别当成错误。
+- 每一步都套超时（连接 3 秒、读写 5 秒）：**「连上了但半天不吭声」是真实存在的坑**，
+  不设超时那条任务就永远挂着，用户永远等不到那一行字。
+
+**连哪儿 / 拿什么密码**（`obs::resolve`，四个字段就是 `config.toml` 里那四个）：
+
+| 字段 | 空 / 0 表示 |
+|---|---|
+| `obs_fill` | `false` = 什么都不做（连都不连，一个字都不多说） |
+| `obs_host` | 空 = `127.0.0.1` |
+| `obs_port` | 0 = 去读 OBS 自己的配置 |
+| `obs_password` | 空 = 去读 OBS 自己的配置 |
+
+- 读的是 `$XDG_CONFIG_HOME/obs-studio/plugin_config/obs-websocket/config.json`
+  （没设 `XDG_CONFIG_HOME` 就退回 `~/.config/…`），**认 `XDG_CONFIG_HOME`**。
+- **配置里写了的优先**：端口和密码两样都写了就一个文件都不读（用户既然写死，
+  说明他清楚自己连的是哪台 OBS）。
+- `server_enabled: false` → 直接给那句人话
+  「OBS 里的 WebSocket 服务器没开：工具 → WebSocket 服务器设置 → 勾上『启用 WebSocket 服务器』」，
+  **别只说「连不上」** —— 用户会跑去折腾端口和防火墙。
+- 没有那个文件 → 另一句人话：说清楚路径 + 「先去 OBS 里 工具 → WebSocket 服务器设置 打开它」。
+- `server_enabled` 字段**缺失**（老版本配置）不算「没开」；端口缺了才退回 4455。
+
+**什么时候填 / 填不上怎么办**：
+
+- 只在开播**成功**（`StartOutcome::Started`）之后填，拿**第一路 rtmp**
+  （`streams.iter().find(|s| s.protocol == "rtmp")`；srt 那几路 OBS 不认）。
+- 填这件事在**另一条 `tokio::spawn`** 上跑，不在开播那条链上：连 OBS 可能要等到超时，
+  挡在那儿就等于「OBS 没开机时开播成功也要多等几秒才显示」。
+- **只填配置，绝不代按「开始推流」**：填配置是准备动作，开播那下得用户自己在 OBS 里按。
+  成功那句话也是这么写的（「开始推流还是你自己按」）。
+- 填失败 / 连不上 / OBS 没开：**只往推流码栏末尾多一行字**
+  （`mpsc<String>` 那条 `obs_notes` 通道 → `Control::on_obs_note`），
+  **绝不**让开播本身显示失败 —— 它走的通道都跟 `LiveEvent` 分开，
+  就是为了让这个语义在类型上就成立（晚几秒到的联动结果改不了开播的结论）。
+- 下一场开播 / 下播时把那一行清掉（`LiveEvent::Started` / `Stopped` 里 `clear`）。
+
 ## 测试
 
 `cargo test` 必须全绿，且**不许引入真实网络请求**（真接口只许手工验，见下）。
@@ -634,6 +720,23 @@ build=<版本接口的 build>  ts=<毫秒>
   两种验证都画到账号栏（真出现半格字符）且不说「失败」；失败只写顶栏那一句；
   推流码栏的提示带 F4 / F5；密钥在宽终端下完整地待在一行、窄终端下不折行；
   确认框画出来有两个按钮且**只有一个反色**；确认层 + 推流码栏在超小终端下不 panic
+- `obs.rs`：鉴权**黄金值**（python 独立算的，别拿 `auth_string` 自己的输出当期望值）；
+  `SetStreamServiceSettings` 的请求体（`rtmp_custom`、`use_auth: false`、
+  **key 原样没被改**、`requestId` 非空）；**假 OBS**（`tokio-tungstenite` 的 `accept_async`
+  那侧）上走完 Hello → Identify → Identified → Request → Response 全程，
+  断言 Identify 里就是那个黄金值、请求体形状对；Hello 里没有 `authentication` 时
+  Identify **不许**带这个字段；OBS 要密码而配置里没有 → 一句提到 `obs_password` 的话；
+  `requestStatus.result = false` → 是错误（带 code / comment）而不是成功；
+  连上但不回话 → 超时放弃（拿小超时跑，别真等）；
+  端口上没人听 → 「连不上」；`resolve` 那套（`XDG_CONFIG_HOME` 指到临时目录造假的 OBS
+  配置：配置为空 → 读文件、只写端口 → 端口以配置为准而密码仍读文件、
+  两样都写 → 一个文件都不读、`server_enabled: false` → 那句人话、文件不存在 → 另一句人话、
+  `server_enabled` 缺字段不算没开、坏 JSON 不 panic）
+- `main.rs`（OBS 那条）：开播成功 → 顺手把**第一路 rtmp**（不是 srt 那一路）发到假 OBS，
+  服务器 / 密钥逐字对得上，回来的那行字里说得出「填哪儿」且带「你自己按」；
+  `obs_fill = false` → 一个字都不多说；这次开播没有 rtmp → 只多一行字、连都不连
+- `ui/control.rs`（OBS 那行字）：`on_obs_note` 只往推流码栏末尾加一行、
+  **不许**动顶栏那句「已开播」；换一场直播（`Stopped` → `Started`）之后上一场那行不许还挂着
 
 改 B 站接口相关代码时顺手确认 `wbi.rs` 那三个黄金值测试还是对的 ——
 它们存在的意义就是接口规则一变就报警。
@@ -661,6 +764,19 @@ build=<版本接口的 build>  ts=<毫秒>
 顺手把 `area_tree::AreaTree::new(areas, 保存的 area_id)` 的可见行打出来（`>` 标光标），
 好一眼看出「到底展开了谁」。同一个探针也给 `--smoke-area 371` 这样带一个 area_id 用。
 放法同上：在 `cli::Cli::parse` **之前**。
+
+**OBS 联动的探针**（2026-10-03 用过，跑完已删）：`--smoke-obs`（只跑 `obs::resolve`，
+纯读文件）和 `--smoke-obs-fill`（`resolve` + `fill`）。**用它必须先把
+`XDG_CONFIG_HOME` 指到一个假目录**：
+
+```bash
+FAKE=$(mktemp -d)                       # 里面没有 obs-websocket/config.json
+XDG_CONFIG_HOME=$FAKE cargo run -q -- --smoke-obs-fill   # 该得到「没找到…去打开它」
+```
+
+**绝不许**拿真 `XDG_CONFIG_HOME` 跑 `--smoke-obs-fill`：这台机器上 obs-websocket 是开着的，
+`fill` 会真的改掉 tc191 的 OBS 推流设置（服务器 + 密钥）。只读的那半（`--smoke-obs`）
+可以拿真 XDG 跑，但**别把读回来的密码打印出来**。
 
 要验界面那一半（按键 -> 写回配置）就**别碰自己的配置**：用一份临时配置跑真 TUI——
 
@@ -797,6 +913,25 @@ AI / 别人**不许**代为跑一遍真接口。他验的时候盯这三件事�
   两个键的提示补回 `Tab::Stream::hint`
 - 37 个新测试（190 个全绿），`cargo clippy --all-targets` 干净
 
+### 已完成（2026-10-03，第七轮：OBS 联动）
+
+- `obs.rs`（新）：obs-websocket 5.x 的 JSON 客户端 —— `Hello / Identify / Identified /
+  Request / Response` 五个操作码、`auth_string`（黄金值钉住）、
+  `set_stream_request`（纯函数拼 `SetStreamServiceSettings`）、
+  `resolve` / `resolve_at`（读 OBS 那份 `config.json`，端口 / 密码留空才读，
+  `server_enabled: false` 和「没文件」各给一句人话）、`fill` / `fill_resolved`
+  （连接 3 秒、每步读写 5 秒的超时；`result: false` 当失败）。
+  非测试部分约 320 行（超了 400 才需要拆目录，现在一个文件够）—— 测试跟别处一样内联
+- `main.rs`：`ObsFill`（配置 + 那行字的通道）+ `spawn_obs_fill` —— 开播成功后才动手、
+  取第一路 rtmp、**另起一条任务**跑（不拖慢开播那条链的结果）、
+  结果只发进 `mpsc<String>`
+- `ui/mod.rs`：`Wiring` 多一条 `obs_notes`（**不并进 `LiveEvent`**：它不是开播的结果）
+- `ui/control.rs`：`obs_note` 字段 + `on_obs_note` —— 那一行字摆在推流码栏末尾，
+  动不了顶栏那句「已开播」；`Started` / `Stopped` 时清掉
+- 15 个新测试（205 个全绿），`cargo clippy --all-targets` 干净
+- **真机探针**（临时 `--smoke-obs` 分支，跑完已删）：拿假 `XDG_CONFIG_HOME` 跑了
+  四组，见下面「实测过」
+
 ### 实测过（真接口）
 
 nav、房间信息（在播/未播两种）、观众榜（3 人 / 50 人两种）、getDanmuInfo（没 -352）、
@@ -899,6 +1034,31 @@ GET <上面那个封面地址>  带 BROWSER_HEADERS 那一套（UA / Origin / Re
   只在 `TestBackend` 上画过；真终端里那个 44 格宽的框长什么样、长密钥被截断那一下
   好不好看，得人眼看过才算。
 
+**OBS 联动的四组探针（2026-10-03，第七轮，`--smoke-obs` / `--smoke-obs-fill`，
+跑完已把探针删掉）**。探针只跑 `obs::resolve` 和 `obs::fill` 的**报错那几条路**，
+一次都没往真 OBS 发请求（那会改掉 tc191 的推流设置）：
+
+```text
+1) 真 XDG（这台机器上那份 ~/.config/obs-studio/.../config.json）：
+   resolve OK host=127.0.0.1 port=4455 密码长度=16     ← 读对了（密码没打印，别打印）
+2) 假 XDG：目录里没有 obs-websocket/config.json
+   resolve/fill ERR 没找到 OBS 的 WebSocket 配置（<路径>），
+                    先去 OBS 里 工具 → WebSocket 服务器设置 打开它
+3) 假 XDG：server_enabled=false
+   resolve/fill ERR OBS 里的 WebSocket 服务器没开：工具 → WebSocket 服务器设置
+                    → 勾上「启用 WebSocket 服务器」
+4) 假 XDG：server_enabled=true + server_port=1（没人听）
+   fill ERR 连不上 OBS 的 WebSocket（ws://127.0.0.1:1/）：IO error: Connection refused
+```
+
+四组都是「一句人话」，没有一个 panic。**顺带发现一件跟任务前提相反的事**：
+这台机器的 `~/.config/obs-studio/plugin_config/obs-websocket/config.json` 里
+`server_enabled` 是 **true**、端口 4455，而且 `ss -ltnp` 显示 `/usr/bin/obs`（pid 676241）
+正听着 4455 —— 也就是说 OBS 这边的 WebSocket 服务器**现在是开着的**
+（Go 版那轮说「没开」，情况已经变了）。所以「真连一次只会得到去打开它的提示」
+这条**没法照原样验**：真要连是连得上的，而连上之后 `fill` 就会**真的改掉他的 OBS 推流设置**，
+没人授权这么干，就没连。
+
 ### 还没验过
 
 **2026-10-03 全部验过了**：tc191 自己按回车改了一次标题、换了一次封面，都成功。
@@ -940,6 +1100,30 @@ GET <上面那个封面地址>  带 BROWSER_HEADERS 那一套（UA / Origin / Re
 - 封面预览只验过**假服务器给的**图 + 一张手工抓下来的真图（见上面「实测过」），
   「从进栏到画出来」这条端到端没在真网络下走过。
 
+**第七轮（OBS 联动）——2026-10-03 真 OBS 上验过了**：
+
+我当时手搓了一个最小 obs-websocket 客户端（python，没依赖）打本机 OBS，全程只读 + 一次
+「原样写回」，结论：
+
+- 握手 → `Hello(op 0)` → `Identify(op 1)` → `Identified(op 2)` → `Request/Response` 全程通，
+  obs-websocket **5.7.4**、OBS **32.2.2 (CachyOS)**
+- `GetVersion` ✅、`GetStreamServiceSettings` ✅
+- **`SetStreamServiceSettings` ✅** —— 把读到的值**原样写回去**（净改动为零），
+  OBS 回 `requestStatus.result = true`，写完再读回来跟写之前逐字节一致。写这条路通了。
+- 顺带一条硬证据：**tc191 自己那组能用的推流设置，形状跟我们填的一模一样** ——
+  `rtmp_custom` + `rtmp://live-push.bilivideo.com/live-bvc/` + 一串 94 字符、以
+  `?streamname=` 开头的密钥。也就是说「密钥整串原样塞进 key、不自己拼」这条规则，
+  他的实际配置就是活证据。
+- 他那台是 `auth_required = false`，所以**鉴权那条分支真机上没走到**（黄金值只对过 python
+  和假 OBS）；哪天他把鉴权打开，这条才算真验过。
+- **现在这台机器上是连得上的**（OBS 正跑着、`server_enabled: true`、4455 在听，见上面
+  「实测过」那段），所以验一次的门槛很低 —— 但 `fill` 会**真的改掉 OBS 的推流设置**，
+  得 tc191 自己愿意的时候跑（跑之前先看清原来那组 server / key，跑完能对回来）。
+- 「OBS 拒绝了这次填写」（`requestStatus.result = false`）只有假 OBS 造出来过；
+  真 OBS 什么情况下会拒（比如请求里有它不认的字段）没见过。
+- 超时那两个常量（连接 3 秒 / 每步 5 秒）是拍的，没在真机上量过。
+- 界面那一行字只在 `TestBackend` 上画出来读过；真终端里那行长文本的观感没看过。
+
 - ~~真发一条弹幕~~ —— 2026-10-03 验过了，见上面「实测过」。
 - ~~扫码登录的落地那半段~~ —— **2026-10-03 真机扫过了**（tc191 拿空 cookie 的临时配置扫的）：
   `86090`（已扫码待确认）→ `0`（成功）整条走通，**cookie 真的写进了配置文件**
@@ -973,12 +1157,24 @@ GET <上面那个封面地址>  带 BROWSER_HEADERS 那一套（UA / Origin / Re
 1. **`INTERACT_WORD_V2` 收不到**：现在房间发的是 V2，名字在 protobuf 的 `pb` 字段里，
    不是 JSON 的 `uname`。所以「XXX 进入了房间」这类提示目前**不会显示**。
    要显示得手写一小段 protobuf varint/length-delimited 解码（Go 版同样没处理 V2）。
-2. 写操作还差**一条：OBS 联动**（开播后把服务器 + 密钥填进 OBS 的「设置 → 推流」）。
-   Go 版在 `obs/obs.go`（OBS WebSocket 5 那套，配置里 `obs_fill` / `obs_host` /
-   `obs_port` / `obs_password` 四个字段已经在了，本轮没人用）。
-   注意它只是**顺手多一件事**：填不进去不能影响开播本身（Go 版就是「多一行红字」）。
+2. ~~写操作还差一条：OBS 联动~~ —— 2026-10-03 第七轮接完了（见上面第 16 条）。
+   留下的口子见下面 2.4。
    （发弹幕第二轮接完，扫码登录第三轮，分区栏第四轮，直播间信息栏第五轮，
-   开播 / 下播 / 推流码第六轮。）
+   开播 / 下播 / 推流码第六轮，OBS 联动第七轮。）
+2.4 **第七轮（OBS 联动）留下的口子**：
+   - ~~跟真 OBS 一次都没连过~~ —— 2026-10-03 验过了（见「还没验过」那节开头）。
+     剩下没走到的只有 `auth_required = true` 那条鉴权分支。
+   - 连真 OBS 的**代价**跟别的写操作不一样：它改的是本机 OBS 的推流设置
+     （服务器 + 密钥），不改 B 站账号。所以「谁来验」得说清楚：只能 tc191 自己在
+     真要开播的时候顺手看（填完看一眼 OBS「设置 → 推流」是不是换成了 B 站那组），
+     AI **不许**代为连一次（那会把他的推流设置改成测试值）。
+   - 只填了**第一路 rtmp**：多路 rtmp（`rtmp-2`）和 srt 那几路都没填。B 站主推流
+     就是第一路，暂时够用；要支持「OBS 里选哪一路」得先在界面上让他选。
+   - OBS 的 `server_enabled: false` 只在**配置里没写端口 / 密码**时才会看出来
+     （两样都写了就不读文件，也就看不到这个开关）。这是照 Go 版的行为抄的：
+     写死了就是用户自己负责。
+   - 失败提示只写在推流码栏末尾；那一刻用户要是在别的栏，得多按一次 `Tab` 才看得到
+     （顶栏那句「已开播」有意没被顶掉）。要不要顺手也写一句顶栏，看下一轮。
 2.0 **第五轮留下的三个口子**（都不影响用，按需接）：
    - 信息栏没有「重新拉一次当前标题 / 封面」的键：一次运行只自动问一次
      （拉失败后切走再切回来会重试）。要补就照分区栏那套（回车重试 / F6 重来）。
@@ -1034,6 +1230,9 @@ GET <上面那个封面地址>  带 BROWSER_HEADERS 那一套（UA / Origin / Re
 - **绝对不要真的开播 / 下播**（`startLive` / `stopLive`）：开播会让 tc191 的直播间
   立刻对外可见、给粉丝推开播推送。测试一律假服务器；唯一能真调的只读探针是
   开播版本号那个 GET（见「怎么手工验真接口」里那一条）
+- **不要顺手连一次真 OBS**（`obs::fill` / `SetStreamServiceSettings`）：这台机器上
+  obs-websocket 现在是开着的（4455 在听），一连上就会**真的改掉 tc191 的 OBS 推流设置**。
+  OBS 那边一律用假服务器（`accept_async`）验；真要连只能他自己来
 - 不要给 `stopLive` 顺手补一个 app 签名（Go 版实测它不带签名）；
   也不要把 app 签名（`appsign`）加到改标题 / 换封面 / 分区表那些接口上
 - 不要为了「跟 web 端统一」把 `appsign` 的编码换成 `url::form_urlencoded` 那套
