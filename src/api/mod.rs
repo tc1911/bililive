@@ -1,5 +1,6 @@
 //! 跟 B 站说话的部分。除了 HTTP 和 JSON，别的什么都不干 —— 界面那边不碰 URL。
 
+pub mod area;
 pub mod client;
 pub mod danmaku;
 pub mod login;

@@ -4,6 +4,7 @@
 //! 顺便把网络那边塞进 channel 的消息取走、重画一帧。TUI 这点开销无所谓，
 //! 而 tokio 是多线程运行时，主线程堵这 100ms 不影响后台的网络任务。
 
+mod area_tree;
 mod control;
 mod qr;
 
@@ -21,6 +22,7 @@ use std::io::stdout;
 use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 
+use crate::api::area::{AreaEvent, AreaRequest};
 use crate::api::danmaku::DanmuMsg;
 use crate::api::login::LoginEvent;
 use crate::api::room::{self, OnlineRankUser, RoomInfo};
@@ -71,6 +73,10 @@ pub struct Wiring {
     pub login_start: Sender<()>,
     /// 登录任务 -> 界面
     pub login_events: Receiver<LoginEvent>,
+    /// 界面 -> 分区任务：拉分区表 / 选定分区
+    pub area: Sender<AreaRequest>,
+    /// 分区任务 -> 界面
+    pub area_events: Receiver<AreaEvent>,
 }
 
 fn setup() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
@@ -310,8 +316,14 @@ async fn event_loop(
         send: send_tx,
         login_start,
         login_events: mut login_rx,
+        area: area_tx,
+        area_events: mut area_rx,
     } = w;
     let mut app = App::default();
+    // 配置里记着的开播分区得先进界面：分区树要等分区表回来才建，而「展开哪个父分区、
+    // 光标停在哪」全指着这一个数（Go 版在这儿没得靠，就写成了「展开列表里第一个」，
+    // 结果永远展开「网游」，跟配置无关）。
+    app.control.seed_area(cfg.area_id, &cfg.area_name);
     loop {
         // 先收网络那边的消息再画，画面永远是最新的。
         while let Ok(m) = danmu_rx.try_recv() {
@@ -325,6 +337,9 @@ async fn event_loop(
         }
         while let Ok(ev) = login_rx.try_recv() {
             app.control.on_login_event(ev);
+        }
+        while let Ok(ev) = area_rx.try_recv() {
+            app.control.on_area_event(ev);
         }
 
         terminal.draw(|f| draw(f, &app, &cfg))?;
@@ -354,6 +369,25 @@ async fn event_loop(
                             // 队列只有一格：扫码任务正忙的时候再按就丢。
                             // 说一句，比让用户对着一个没反应的键连按强。
                             app.control.set_message("扫码任务正忙，等它一下再看看");
+                        }
+                    }
+                    Action::LoadAreas => {
+                        if area_tx.try_send(AreaRequest::Load).is_err() {
+                            // 容量 4，正常按不出这个。真撞上了也得说清楚：
+                            // 屏幕上还写着「正在拉分区表…」，用户会一直等。
+                            app.control.set_message("分区任务正忙，等它一下再回车");
+                        }
+                    }
+                    Action::PickArea { id, name } => {
+                        if area_tx
+                            .try_send(AreaRequest::Pick {
+                                id,
+                                name: name.clone(),
+                            })
+                            .is_err()
+                        {
+                            app.control
+                                .set_message(format!("{name} 没能写进配置（分区任务正忙），再回车试一次"));
                         }
                     }
                     Action::ToMain => {
@@ -1134,6 +1168,52 @@ mod tests {
             !out.contains('▀') && !out.contains('▄'),
             "登录成功后二维码该收掉：\n{out}"
         );
+    }
+
+    /// 分区栏：拉回来的两级分区表真的摆进了右栏 —— 父分区带展开标记，
+    /// 没配过的时候一个子分区都不露出来（Go 版在这儿永远展开「网游」）。
+    #[test]
+    fn area_pane_draws_the_two_level_tree() {
+        use crate::api::area::{AreaEvent, ParentArea, SubArea};
+
+        let cfg = Config::default();
+        let mut app = App::default();
+        app.control
+            .on_login_event(LoginEvent::LoggedIn("小明 (uid 7)".into()));
+        app.control.handle_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        app.control.handle_key(KeyCode::Tab, KeyModifiers::NONE); // 分区栏
+        app.control.on_area_event(AreaEvent::Loaded(vec![
+            ParentArea {
+                name: "网游".into(),
+                list: vec![SubArea {
+                    id: 86,
+                    name: "英雄联盟".into(),
+                }],
+            },
+            ParentArea {
+                name: "虚拟主播".into(),
+                list: vec![SubArea {
+                    id: 371,
+                    name: "虚拟日常".into(),
+                }],
+            },
+        ]));
+
+        let out = render(&app, &cfg, 100, 30);
+        assert!(flat(&out).contains("全部分区"), "{out}");
+        assert!(flat(&out).contains("▸网游"), "收起的父分区要带标记：{out}");
+        assert!(flat(&out).contains("▸虚拟主播"), "{out}");
+        assert!(
+            !flat(&out).contains("英雄联盟"),
+            "没配过时子分区不该露出来：{out}"
+        );
+
+        // 移到「网游」上按 → 展开：子分区就出现了
+        app.control.handle_key(KeyCode::Down, KeyModifiers::NONE);
+        app.control.handle_key(KeyCode::Right, KeyModifiers::NONE);
+        let out = render(&app, &cfg, 100, 30);
+        assert!(flat(&out).contains("▾网游"), "{out}");
+        assert!(flat(&out).contains("英雄联盟"), "{out}");
     }
 }
 

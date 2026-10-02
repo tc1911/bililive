@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -95,6 +95,19 @@ impl Config {
         }
     }
 
+    /// 选定开播分区：只动 `area_id` / `area_name` 两个字段。
+    ///
+    /// **先读一遍再写**。内存里那份配置是启动时读的，之后用户可能刚扫码登录过
+    /// （`apply_login` 往同一个文件里写进了新 cookie），也可能在外面手改过房间号。
+    /// 拿内存里那份旧配置整个覆盖上去，就等于把刚扫的登录、刚改的房间号一起冲掉
+    /// —— 现象是「登录成功了，选个分区又变回未登录」。
+    pub fn save_area(path: &Path, area_id: i64, area_name: &str) -> Result<()> {
+        let mut cfg = Config::load_or_create(Some(path))?;
+        cfg.area_id = area_id;
+        cfg.area_name = area_name.to_string();
+        cfg.save_to(path)
+    }
+
     pub fn path() -> Result<PathBuf> {
         let base = match std::env::var_os("XDG_CONFIG_HOME") {
             Some(v) if !v.is_empty() => PathBuf::from(v),
@@ -104,5 +117,70 @@ impl Config {
             }
         };
         Ok(base.join("bililive").join("config.toml"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 每个测试用自己的一份临时配置：测试是并行跑的，共用一个文件名会互相踩。
+    fn temp_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bililive-test-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("config.toml")
+    }
+
+    /// 写回分区只许动那两个字段：cookie、房间号、OBS 那些都得原封不动。
+    #[test]
+    fn save_area_touches_only_the_two_area_fields() {
+        let path = temp_path("save-area");
+        let cfg = Config {
+            cookie: "SESSDATA=abc; bili_jct=def".into(),
+            room_id: 9527,
+            obs_fill: false,
+            show_time: false,
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+
+        Config::save_area(&path, 371, "虚拟主播/虚拟日常").unwrap();
+
+        let back = Config::load_or_create(Some(&path)).unwrap();
+        assert_eq!(back.area_id, 371);
+        assert_eq!(back.area_name, "虚拟主播/虚拟日常");
+        assert_eq!(
+            back.cookie, "SESSDATA=abc; bili_jct=def",
+            "cookie 不许被冲掉"
+        );
+        assert_eq!(back.room_id, 9527, "房间号不许被冲掉");
+        assert!(!back.obs_fill);
+        assert!(!back.show_time);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 内存里那份配置是**启动时**读的，选分区之前可能已经有别的链路写过盘
+    /// （`apply_login` 就是这么干的）。写回分区必须重新读一遍。
+    #[test]
+    fn save_area_rereads_the_file_before_writing() {
+        let path = temp_path("save-area-reread");
+        let startup = Config {
+            room_id: 6,
+            ..Config::default()
+        };
+        startup.save_to(&path).unwrap();
+
+        // 模拟「扫码登录刚落地」：另一条链路把新 cookie 写进了同一个文件
+        let mut later = Config::load_or_create(Some(&path)).unwrap();
+        later.cookie = "SESSDATA=fresh".into();
+        later.save_to(&path).unwrap();
+
+        Config::save_area(&path, 235, "娱乐/视频唱见").unwrap();
+
+        let back = Config::load_or_create(Some(&path)).unwrap();
+        assert_eq!(back.cookie, "SESSDATA=fresh", "写回分区前必须重读一遍文件");
+        assert_eq!(back.area_id, 235);
+        assert_eq!(back.room_id, 6);
+        let _ = std::fs::remove_file(&path);
     }
 }
