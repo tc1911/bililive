@@ -6,6 +6,7 @@
 
 mod area_tree;
 mod control;
+mod cover;
 mod qr;
 
 use std::collections::VecDeque;
@@ -24,6 +25,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::api::area::{AreaEvent, AreaRequest};
 use crate::api::danmaku::DanmuMsg;
+use crate::api::info::{InfoEvent, InfoRequest};
 use crate::api::login::LoginEvent;
 use crate::api::room::{self, OnlineRankUser, RoomInfo};
 use crate::config::Config;
@@ -77,6 +79,10 @@ pub struct Wiring {
     pub area: Sender<AreaRequest>,
     /// 分区任务 -> 界面
     pub area_events: Receiver<AreaEvent>,
+    /// 界面 -> 信息任务：拉当前标题 / 改标题 / 换封面
+    pub info: Sender<InfoRequest>,
+    /// 信息任务 -> 界面
+    pub info_events: Receiver<InfoEvent>,
 }
 
 fn setup() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
@@ -318,6 +324,8 @@ async fn event_loop(
         login_events: mut login_rx,
         area: area_tx,
         area_events: mut area_rx,
+        info: info_tx,
+        info_events: mut info_rx,
     } = w;
     let mut app = App::default();
     // 配置里记着的开播分区得先进界面：分区树要等分区表回来才建，而「展开哪个父分区、
@@ -331,8 +339,9 @@ async fn event_loop(
         }
         while let Ok(r) = room_rx.try_recv() {
             // 顺手把标题喂给配置页的「直播间信息」栏，省得那一栏空着让人以为坏了 ——
-            // 这轮它自己不发请求（真去改标题是下一步）。
+            // 封面也一样：地址先摆上，预览那张图由「进这一栏时拉一次」触发（`LoadRoomMeta`）。
             app.control.seed_title(&r.title);
+            app.control.seed_cover(&r.cover);
             app.room = Some(r);
         }
         while let Ok(ev) = login_rx.try_recv() {
@@ -340,6 +349,9 @@ async fn event_loop(
         }
         while let Ok(ev) = area_rx.try_recv() {
             app.control.on_area_event(ev);
+        }
+        while let Ok(ev) = info_rx.try_recv() {
+            app.control.on_info_event(ev);
         }
 
         terminal.draw(|f| draw(f, &app, &cfg))?;
@@ -388,6 +400,27 @@ async fn event_loop(
                         {
                             app.control
                                 .set_message(format!("{name} 没能写进配置（分区任务正忙），再回车试一次"));
+                        }
+                    }
+                    // 改标题 / 换封面是写操作，全在信息任务那边落地（界面不碰网络）。
+                    // 三条都只有容量 4 的队列，正常按不出「忙」；真撞上了也得说一句，
+                    // 屏幕上还写着「正在提交…」，用户会一直等。
+                    Action::LoadRoomMeta => {
+                        if info_tx.try_send(InfoRequest::LoadMeta).is_err() {
+                            // 这一下没送出去，就得把「正在问」的标志放掉：
+                            // 不然这一栏永远停在那儿等一个不会被发的请求
+                            app.control.info_request_dropped();
+                            app.control.set_message("信息任务正忙，等一下再切回这一栏");
+                        }
+                    }
+                    Action::SetTitle(title) => {
+                        if info_tx.try_send(InfoRequest::SetTitle(title)).is_err() {
+                            app.control.set_message("信息任务正忙，这条标题没提交，再回车试一次");
+                        }
+                    }
+                    Action::SetCover(cover) => {
+                        if info_tx.try_send(InfoRequest::SetCover(cover)).is_err() {
+                            app.control.set_message("信息任务正忙，这次换封面没提交，再回车试一次");
                         }
                     }
                     Action::ToMain => {
@@ -1167,6 +1200,47 @@ mod tests {
         assert!(
             !out.contains('▀') && !out.contains('▄'),
             "登录成功后二维码该收掉：\n{out}"
+        );
+    }
+
+    /// 直播间信息栏：两行字段（选中的那行带 ▸）、说明、下面那一格是封面预览。
+    /// 有地址还没图 = 「加载中」；图挂了 = 一句话。半格字符怎么画在 `ui/cover.rs` 里验。
+    #[test]
+    fn info_pane_shows_the_fields_and_the_cover_box() {
+        let cfg = Config::default();
+        let mut app = App::default();
+        app.control
+            .on_login_event(LoginEvent::LoggedIn("小明 (uid 7)".into()));
+        app.control.handle_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        app.control.handle_key(KeyCode::F(6), KeyModifiers::NONE);
+
+        // 一进来还没拉到：封面那一格写的是「还没有封面」
+        let out = render(&app, &cfg, 100, 30);
+        assert!(flat(&out).contains("直播间信息"), "{out}");
+        assert!(flat(&out).contains("▸标题"), "选中的那行要带 ▸：{out}");
+        assert!(flat(&out).contains("封面"), "{out}");
+        assert!(flat(&out).contains("当前封面"), "预览那一格要有标题：{out}");
+
+        // 拉到了：标题摆上、封面地址有了但图还没到 -> 「加载中」
+        let url = "https://i0.hdslb.com/bfs/live/user_cover/x.png";
+        app.control.on_info_event(InfoEvent::Meta {
+            title: "今晚八点随便播播".into(),
+            cover: url.into(),
+        });
+        let out = render(&app, &cfg, 100, 30);
+        assert!(flat(&out).contains("今晚八点随便播播"), "{out}");
+        assert!(flat(&out).contains("封面加载中"), "{out}");
+
+        // 图是垃圾字节：只在那写一句话，整页照样画得出来
+        app.control.on_info_event(InfoEvent::CoverImage {
+            url: url.into(),
+            bytes: b"nope".to_vec(),
+        });
+        let out = render(&app, &cfg, 100, 30);
+        assert!(flat(&out).contains("封面没加载上"), "{out}");
+        assert!(
+            flat(&out).contains("今晚八点随便播播"),
+            "别的地方不受影响：{out}"
         );
     }
 

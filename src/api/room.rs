@@ -30,6 +30,9 @@ pub struct RoomInfo {
     pub title: String,
     pub parent_area_name: String,
     pub area_name: String,
+    /// 主播设的那张房间封面。接口字段叫 `user_cover`（老文档里的 `cover` 现在不返了），
+    /// 有时是 `//i0.hdslb.com/...` 这种协议相对地址。
+    pub cover: String,
     pub online: i64,
     pub attention: i64,
     /// 0 未开播 / 1 直播中 / 2 轮播
@@ -51,6 +54,7 @@ impl RoomInfo {
             title: String::new(),
             parent_area_name: String::new(),
             area_name: String::new(),
+            cover: String::new(),
             online: 0,
             attention: 0,
             live_status: 0,
@@ -69,10 +73,18 @@ pub async fn fetch_room_info(client: &BiliClient, base: &str, room_id: i64) -> R
 
     let live_status = int_of(&d["live_status"]);
     let mut info = RoomInfo::new(room_id);
+    // 接口会把房间号一起回给我们：配置里那个可能是**短号**（比如 `6`），
+    // 服务端认的是规范号（`7734200`）。改标题那种写操作拿规范号更稳，
+    // 所以这个字段以服务端说的为准，查不到才退回问的那个。
+    let server_id = int_of(&d["room_id"]);
+    if server_id > 0 {
+        info.room_id = server_id;
+    }
     info.uid = int_of(&d["uid"]);
     info.title = str_of(&d["title"]);
     info.parent_area_name = str_of(&d["parent_area_name"]);
     info.area_name = str_of(&d["area_name"]);
+    info.cover = str_of(&d["user_cover"]);
     info.online = int_of(&d["online"]);
     info.attention = int_of(&d["attention"]);
     info.live_status = live_status;
@@ -125,10 +137,12 @@ pub async fn sync_loop(
         match fetch_room_info(&client, &base, room_id).await {
             Ok(fresh) => {
                 // 这一版最全，替换掉 last 里的对应字段；uid 留着给观众榜用。
+                last.room_id = fresh.room_id;
                 last.uid = fresh.uid;
                 last.title = fresh.title;
                 last.parent_area_name = fresh.parent_area_name;
                 last.area_name = fresh.area_name;
+                last.cover = fresh.cover;
                 last.online = fresh.online;
                 last.attention = fresh.attention;
                 last.live_status = fresh.live_status;
@@ -185,6 +199,7 @@ mod tests {
             r#"{{"code":0,"message":"0","data":{{
                 "room_id":9527,"uid":42,"title":"随便播播",
                 "parent_area_name":"虚拟主播","area_name":"虚拟日常",
+                "user_cover":"//i0.hdslb.com/bfs/live/user_cover/abc.jpg",
                 "online":1234,"attention":56789,
                 "live_status":{live_status},"live_time":"{live_time}"}}}}"#
         )
@@ -201,14 +216,15 @@ mod tests {
     async fn room_info_request_shape_and_parse() {
         let srv = test_http::start(|_| (200, room_body(0, "0000-00-00 00:00:00"))).await;
         let client = BiliClient::new("SESSDATA=abc; bili_jct=def").unwrap();
-        let info = fetch_room_info(&client, &srv.base, 9527).await.unwrap();
+        // 故意拿**短号** 6 去查（配置里就是这种短号），body 里回的是规范号 9527
+        let info = fetch_room_info(&client, &srv.base, 6).await.unwrap();
 
         let hits = srv.hits();
         assert_eq!(hits.len(), 1);
         let r = &hits[0];
         assert_eq!(r.method, "GET");
         assert_eq!(r.path, "/room/v1/Room/get_info");
-        assert_eq!(r.query_param("room_id"), Some("9527"));
+        assert_eq!(r.query_param("room_id"), Some("6"));
         // 风控认这套头，缺一个就可能返 -352
         assert!(r.header("user-agent").unwrap().contains("Mozilla"));
         assert_eq!(r.header("referer"), Some("https://live.bilibili.com/"));
@@ -216,9 +232,16 @@ mod tests {
         assert!(r.header("cookie").unwrap().contains("SESSDATA=abc"));
 
         assert_eq!(info.title, "随便播播");
+        // 房间号以**服务端回的**为准：配置里的短号（6）跟规范号（7734200）不是一回事，
+        // 改标题那种写操作要用规范号
+        assert_eq!(info.room_id, 9527);
         assert_eq!(info.uid, 42);
         assert_eq!(info.parent_area_name, "虚拟主播");
         assert_eq!(info.area_name, "虚拟日常");
+        // 封面字段叫 user_cover（老文档里的 cover 现在不返了），
+        // 而且有时是 `//i0.hdslb.com/...` 这种协议相对地址 —— 原样收下来，
+        // 补 https 是预览那边的事（`api::info::absolute_image_url`）
+        assert_eq!(info.cover, "//i0.hdslb.com/bfs/live/user_cover/abc.jpg");
         assert_eq!(info.online, 1234);
         assert_eq!(info.attention, 56789);
         assert_eq!(info.live_status, 0);

@@ -119,6 +119,13 @@ impl BiliClient {
         self
     }
 
+    /// 主站 base。图床上传（`api.bilibili.com/x/upload/web/image`）跟 nav 同一个域，
+    /// 走的是同一个字段 —— 测试里 `with_main_base` 把它顶成假服务器，那时上传也得跟着走假的，
+    /// 所以别在图床那儿写死 `MAIN_BASE`。
+    pub fn main_base(&self) -> &str {
+        &self.main_base
+    }
+
     /// 登录令牌。没登录（或配置里那串 Cookie 不全）时是 `None`，
     /// 发送端据此在**发请求之前**就说清楚缺什么，而不是等一个含糊的 `-101`。
     ///
@@ -245,11 +252,75 @@ impl BiliClient {
     }
 
     /// POST 表单并拆掉 `{code,message,data}` 外壳，`code != 0` 一律转成错误。
-    /// 留给下一步的改标题 / 改封面用（发弹幕要看 message，走 `post_form_raw`）。
-    #[allow(dead_code)]
+    /// 改标题 / 换封面走这条（那两句 message 本来就是给用户看的，折进错误里正合适）；
+    /// 发弹幕要看服务端原话，所以那条走 `post_form_raw`。
     pub async fn post_form(&self, url: &str, form: &[(&str, String)]) -> Result<Value> {
         let v = self.post_form_raw(url, form).await?;
         unwrap(url, v)
+    }
+
+    /// POST 一个 multipart 表单（传图床用），拆掉 `{code,message,data}` 外壳。
+    ///
+    /// 边界和 content-type 交给 `reqwest::multipart`：手拼 boundary 迟早会撞上
+    /// 「文件内容里正好出现那一行」这种鬼事。cookie 还是自己挂（跟别处一个口径）。
+    pub async fn post_multipart(
+        &self,
+        url: &str,
+        form: reqwest::multipart::Form,
+    ) -> Result<Value> {
+        let mut req = self.http.post(url).multipart(form);
+        if let Some(cookie) = self.auth.lock().await.header.clone() {
+            req = req.header(reqwest::header::COOKIE, cookie);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow!("请求 {} 失败: {e}", short(url)))?;
+        let status = resp.status();
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow!("读 {} 的响应失败: {e}", short(url)))?;
+        let v: Value = serde_json::from_str(&text).map_err(|_| {
+            anyhow!(
+                "{} 返回的不是 JSON (HTTP {status}): {}",
+                short(url),
+                truncate(&text, 200)
+            )
+        })?;
+        unwrap(url, v)
+    }
+
+    /// 拉一段二进制（封面预览那张图）。**不带 cookie**：图在 `hdslb.com` 上，
+    /// 那是另一个域，登录凭据不该跟着跑到图床的日志里去。
+    ///
+    /// 大小有上限：封面图再大也不该有 8M，没上限的话一张「8K 原图」能把内存吃掉一半。
+    pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        /// 跟 Go 版 `cover.fetchLimit` 一致。
+        const MAX_BYTES: usize = 8 << 20;
+        let resp = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| anyhow!("请求 {} 失败: {e}", short(url)))?;
+        let status = resp.status();
+        if !status.is_success() {
+            bail!("{} 返回 HTTP {status}", short(url));
+        }
+        if let Some(len) = resp.content_length()
+            && len > MAX_BYTES as u64
+        {
+            bail!("{} 说有 {len} 字节，太大了不抓", short(url));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("读 {} 的响应失败: {e}", short(url)))?;
+        if bytes.len() > MAX_BYTES {
+            bail!("{} 超过了 8M，不抓", short(url));
+        }
+        Ok(bytes.to_vec())
     }
 
     /// nav：一次拿 uid 和 WBI 种子。缓存见 `NAV_TTL`。

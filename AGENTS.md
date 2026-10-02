@@ -8,11 +8,12 @@
 参照物是本机的 Go 版 `../bilibili_live_tui+`（读它的代码摸行为，**不抄代码**，
 也**不要改那个仓库**）。两边共用同一份账号思路，但配置文件和字段名是不同的两套。
 
-**当前进度：读 + 发弹幕 + 扫码登录 + 选分区** —— 看弹幕、看房间信息、看观众榜，
-底部输入框能打字、回车发弹幕（超 20 字自动切段连发）；
+**当前进度：读 + 发弹幕 + 扫码登录 + 选分区 + 改标题 / 换封面** —— 看弹幕、看房间信息、
+看观众榜，底部输入框能打字、回车发弹幕（超 20 字自动切段连发）；
 第二页（配置页）能翻了，账号栏能扫码登录并把 cookie 写回配置，
-分区栏是一棵真分区树（拉分区表 / 选分区 / 只把 area_id + area_name 写回配置）。
-开播 / 下播 / 改标题 / 改封面 / OBS 联动**一行都还没写**。
+分区栏是一棵真分区树（拉分区表 / 选分区 / 只把 area_id + area_name 写回配置），
+直播间信息栏能改标题、换封面（本地图先传 B 站图床），下半格还画当前封面。
+**开播 / 下播 / 推流码 / OBS 联动一行都还没写**（appkey 那套签名也没接）。
 
 ## 常用命令
 
@@ -62,13 +63,16 @@ api/
   room.rs        房间信息 + 观众榜 + 30 秒轮询
   danmaku.rs     弹幕：上半是**纯函数**（拆包/解压/解析），下半才是 wss 和重连
   send.rs        发弹幕：切段纯函数 + POST /msg/send + 发送任务（唯一的写链路）
+  info.rs        直播间信息：改标题 / 传 B 站图床 / 写封面（三个接口 + 两条消息类型）
   login.rs       扫码登录：poll 的 code → 下一步（纯函数）+ cookie 拼装（纯函数）
                  + generate/poll 两个接口 + 扫码任务
   test_http.rs   只给测试用的假 HTTP 服务器（不引 wiremock）
 ui/mod.rs        第一页（弹幕）：画图 + 收键 + 输入框状态；只碰 channel，不碰网络
-ui/control.rs    第二页（配置）：页面 / 功能栏状态机 + 布局 + 编辑骨架，同样不碰网络
+ui/control.rs    第二页（配置）：页面 / 功能栏状态机 + 布局 + 信息栏的选/编辑/提交
+                 （提交只扔一个 `Action` 出去），同样不碰网络
 ui/area_tree.rs  分区树的**纯逻辑**：可见行 / 光标 / 展开状态 / 窗口（只算不画）
 ui/qr.rs         二维码：半格字符 + 真彩色（纯函数）
+ui/cover.rs      封面预览：解码 -> 区域平均缩图 -> 按控件大小现采样成半格字符（跟二维码一个套路）
 ```
 
 数据流是单向的，别绕开：
@@ -89,12 +93,22 @@ ui 的配置页           --(mpsc<AreaRequest>, 容量 4)--> main::area_task
 main::area_task      --(api::area::fetch_areas)----> api.live.bilibili.com/room/v1/area/getList
 main::area_task      --(config::save_area 写盘)----> config.toml（只动 area_id / area_name）
 main::area_task      --(mpsc<AreaEvent>)---------> ui 的配置页（分区树 / 提示）
+ui 的配置页           --(mpsc<InfoRequest>, 容量 4)--> main::info_task
+main::info_task      --(api::room::fetch_room_info)--> api.live.bilibili.com/room/v1/Room/get_info
+main::info_task      --(api::info::update_title)-----> api.live.bilibili.com/room/v1/Room/update
+main::info_task      --(api::info::upload_image)-----> api.bilibili.com/x/upload/web/image（multipart）
+main::info_task      --(api::info::update_cover)-----> api.live.bilibili.com/xlive/app-blink/v1/preLive/UpdatePreLiveInfo
+main::info_task      --(client.get_bytes)-----------> 封面图（i0.hdslb.com，**不带 cookie**）
+main::info_task      --(mpsc<InfoEvent>, 容量 4)----> ui 的配置页（标题 / 封面 / 提示 / 封面图）
+main::info_task      --(mpsc<()>)------------------> room::sync_loop（改完顺手重拉房间信息）
 ```
 
 **写在两个地方的东西只有两个**：`login_loop` 只跟接口说话（不碰磁盘、不碰界面），
 `apply_login` 只管落盘和重启链路（不碰网络请求的构造）。分界别混。
 分区那条照抄这个分工：`api/area.rs` 只管接口，`main::area_task` 才是「拉表 + 落盘」的落点
 （界面两件事都不许自己干，所以两种请求都从同一条 `mpsc<AreaRequest>` 进去）。
+直播间信息那条同理：`api/info.rs` 只管接口，`main::info_task` 才是「先传图床再写封面」
+这个**顺序**的落点（界面不许自己发请求，所以三条请求都从 `mpsc<InfoRequest>` 进去）。
 
 ## 硬约束（改代码前必读）
 
@@ -163,6 +177,9 @@ host（`*.chat.bilibili.com`），没有 -352；wss 认证包发出后收到 `op
 | 历史弹幕 | `.../xlive/web-room/v1/dM/gethistory?roomid=` | 不需要签名；**进程级只拉一次**，重连再拉会把同一批重放一遍 |
 | 发弹幕 | `.../msg/send`（POST） | URL 带 WBI 签名（**只签 `web_location=444.8`**），表单见下面第 10 条 |
 | 分区表 | `.../room/v1/area/getList` | 不带参数、不用登录，一次两级（父分区里套 `list`）；子分区 `id` 是**字符串**，见第 13 条 |
+| 改标题 | `.../room/v1/Room/update`（POST） | 只带 `room_id` / `title` / `platform=pc_link` / `csrf` / `csrf_token`，见第 14 条 |
+| 传图床 | `api.bilibili.com/x/upload/web/image`（POST multipart） | 字段 `file` / `bucket=openplatform` / `csrf`；**主站域，不是直播域** |
+| 写封面 | `.../xlive/app-blink/v1/preLive/UpdatePreLiveInfo`（POST） | 挂在 app-blink 下但只带 csrf，**不要 app 签名**，见第 14 条 |
 
 `nav` 的 img_key/sub_key 和 uid 一起缓存 30 分钟（key 每天轮换，但也别每个请求都问一遍）。
 
@@ -336,6 +353,76 @@ cookie），整个覆盖过去就是「登录成功 → 选个分区 → 变回�
   用户只会得出「按键失灵」这个结论。选中的那一行**整行反色**（Go 版靠 tview 的高亮）。
 - 「接口给了一张空表」不算失败：退回「还没有表」的状态并说一句，回车还能再拉。
 
+### 14. 直播间信息（配置页的「直播间信息」栏）
+
+两个字段（标题 / 封面）：`↑↓` 选、`回车` 进编辑、再 `回车` 提交、`Esc` 还原。
+提交结果（成功 / 失败原因）写在顶栏那条「最近一条消息」里 —— 失败**只写一句话**，
+绝不 panic、绝不退出，值也照着用户填的留在那一行（他多半想在那个基础上改）。
+
+**接口**（`api/info.rs`，三个都是写操作）：
+
+| 用途 | 路径 | 表单 |
+|---|---|---|
+| 改标题 | `api.live.bilibili.com/room/v1/Room/update` | `room_id` / `title` / `platform=pc_link` / `csrf` / `csrf_token` |
+| 传图床 | `api.bilibili.com/x/upload/web/image` | multipart：`file`（文件名取路径最后一段）/ `bucket=openplatform` / `csrf` |
+| 写封面 | `api.live.bilibili.com/xlive/app-blink/v1/preLive/UpdatePreLiveInfo` | `platform=web` / `mobi_app=web` / `build=1` / `csrf` / `csrf_token` / `cover` |
+
+- **`csrf` 和 `csrf_token` 都取 cookie 里的 `bili_jct`，同一个值**（老接口读 csrf、
+  新接口读 csrf_token，只给一个总有半边不认）。取不到 `bili_jct` 就**在发请求之前**
+  报错（`api/info.rs::csrf`），别拿空串去换一句含糊的 `-111`。
+- **标题上限 40 个字符，不是 40 字节**（`MAX_TITLE_CHARS`，界面和接口共用这一个常量）。
+  服务端超了只回一句看不懂的错，所以**输入时**就拦：第 41 个按键直接不收
+  （Go 版用的是 InputField 的 `SetAcceptanceFunc`），提交前再 `check_title` 兜一道。
+  口径按 Unicode 标量算（一个汉字 = 一个字符，一个 emoji = 一个字符；
+  带 ZWJ 的组合 emoji 会算好几个 —— 跟 Go 的 `RuneCountInString` 一致）。
+- **换封面是两步，顺序不能反**：先把本地图传到 B 站图床拿到 `.hdslb.com` 地址，
+  再拿那个地址去 `UpdatePreLiveInfo`。别处的链接服务端一律回 `100402`（图片地址不合法）。
+  第一步没过**就别去写第二步**（写上去的地址根本不是图床的，只会换个 100402 回来）。
+- **`UpdatePreLiveInfo` 不要 app 签名**：它虽然挂在 `app-blink`（直播姬）下，
+  但网页端只带 csrf 就能过。appkey / appsec 那套是**开播**接口才用的（下一轮的事，
+  别顺手加）。单测里直接断言请求体里没有 `appkey` / `sign=`。
+- 图床地址两个字段都得认：`data.image_url` 或 `data.location`。
+  **`location` 是 `http://`，要升成 `https://`**（这一条来自 Go 版（实测过图床的那个版本）
+  的注释：http 的地址会被下游当不安全链接拒掉。**我们这边没真传过图**，
+  第一次传完记得回来看一眼 `data` 里到底是哪个字段、是不是 http）。
+  **两个都没有就报错**，绝不返回空串继续往下走 —— 那样用户看到的是「封面已提交」，
+  而服务端早就用 100402 拒了。`//i0.hdslb.com/...` 这种协议相对地址也补成 https
+  （直接扔给 `reqwest` 会报「relative URL without a base」）。
+- 封面路径支持 `~`：`File::open` / `tokio::fs::read` 都不认它，得自己展开
+  （`api::info::expand_home`，家目录从外面喂进去所以能单测）。`./` `../` 不用管。
+- **封面留空 = 不改动**，不是错误：说一句「封面留空，没有改动」就完事。
+- 房间号：用**配置里那个**（可能是短号 `6`）去查 `get_info`，拿回来的**规范号**
+  （响应里的 `room_id`，比如 `7734200`）才用来写标题 —— 短号也查得到，
+  但写操作拿规范号更稳。`RoomInfo::room_id` 现在以服务端回的为准，别改回去。
+
+**界面这一半**：
+
+- 切进这一栏时**自动**去 `Room/get_info` 拉一次（`Action::LoadRoomMeta`）：
+  标题要预填、封面要地址。一次运行只问一次；**拉失败不算问过**，下次切回来会重试一次
+  （但不会变成「每切一次栏打一次接口」——跟分区栏一个口径）。读不到**不等于改不了**：
+  输入框照用，界面上只留一句「可以直接输入：…」。
+- 预填**只填空的那一行**（`seed_title` / `seed_cover` / `on_info_event` 三处同一口径）：
+  慢网下用户可能已经敲了一半，回复来了不能把人家打的字冲掉（Go 版 `loadTitle` 同理）。
+- 提交是**动作**不是副作用：`handle_key` 返回 `Action::SetTitle` / `Action::SetCover`，
+  `event_loop` 把它们塞进 `mpsc<InfoRequest>`（容量 4），网络那一下在 `main::info_task`。
+  **别把这条链收回界面** —— 界面不碰网络、不碰磁盘是这个项目写死的分工。
+- 改完（成功时）顺手给房间信息那条链路发一次手动刷新，别让人对着旧标题等满 30 秒
+  （服务端也可能要几秒才生效，那就等下一轮）。
+
+**封面预览**（`ui/cover.rs`）：
+
+- 图是信息任务抓的（`client.get_bytes`，**不带 cookie**：图在 `hdslb.com` 上，
+  那是另一个域）。抓不到只让预览那一格写一句话，**不能说成「换封面失败」**。
+  同一个地址不重复抓（切栏、拉伸终端都不重新下载图片）。
+- 解码 / 缩放 / 采样都在**界面**这边：过来的是原始字节，`Cover::set_bytes` 一次解码 +
+  区域平均缩到 96×140 存着；画的时候按**控件当前大小**现采样 ——
+  终端一拉伸下一帧就跟着变，不用重新抓图。`image` crate 只开 `jpeg,png`
+  （`Cargo.toml` 里显式写的，**别开 default**：那串 avif/exr/webp 用不上。
+  它本来就是 qrcode 带进来的依赖树，显式加一条只是为了能直接用）。
+- 一格 = 上下两个像素（`▀` + 前景色 / 背景色），跟二维码一个套路。
+  解码跑在事件循环里（几十毫秒一次，只在换图那一下）——真碰上超大图会卡一帧，
+  比多铺一条通道简单，认了。
+
 ## 测试
 
 `cargo test` 必须全绿，且**不许引入真实网络请求**（真接口只许手工验，见下）。
@@ -380,6 +467,29 @@ cookie），整个覆盖过去就是「登录成功 → 选个分区 → 变回�
 - `api/area.rs`：假服务器上断言**请求路径 + 不带参数 + 浏览器头**；照真响应抄的 body
   里子分区 id 是字符串也要收对；空表不算错；父分区缺 `list` / `list: null` / `list: []`
   三种都留成空支；`code != 0` 变 `Err`
+- `api/info.rs`：标题上限按**字符**（40 个中文放行、41 个拦下、40/41 个 emoji 各一条、
+  14 个中文不能因为「42 字节」被冤枉）；`Room/update` 的表单**五个字段一个不多一个不少**、
+  超长标题一个请求都不发、没有 `bili_jct` 时一个请求都不发；图床那次的 multipart
+  （字段名 / 文件名 / 文件内容 / csrf，二进制内容按 `body_raw` 比）；
+  `UpdatePreLiveInfo` 的六个字段**且没有 appkey / sign**；`pick_image_url` 的五种形状
+  （都给 / 只 `location`（http 升 https）/ 只 `image_url` / 协议相对 / 都不给要报错）；
+  `~` 展开（`~`、`~/x`、`/tmp/~/x`、`./x`、拿不到家目录）
+- `ui/cover.rs`：真 PNG 编码再解码的往返（小图不放大、400×200 缩成 96×48）；垃圾字节
+  只留一句话不 panic；三种没图时的提示（还没有 / 加载中 / 加载失败）；
+  一格一个 `▀` 且前景 = 上半个像素、背景 = 下半个像素（真彩色，
+  跟调色板色区分开）；**同一个图换个更宽的框，画出来就跟着宽**
+  （「尺寸跟控件走」那条）；0×0 / 1×1 / 0 高的框都不越界
+- `ui/control.rs`（信息栏那一组）：40 个字的上限按按键拦（中文、emoji 各一条，
+  退一个还能再进一个）；进编辑 → 改动 → `Esc` 还原 / `回车` 提交两条路都断言值
+  （提交出去的是 `Action::SetTitle` / `SetCover`，带的是用户填的那个串）；
+  空标题不许提交、封面留空只是「没有改动」；切进这一栏自动拉一次 meta、
+  拉到过就不再问、失败过会再试一次；信息事件只动显示状态（预填不覆盖用户敲的字、
+  成功失败各留一句话、垃圾封面图不许把界面带走）；`try_send` 失败时
+  `info_request_dropped` 要把「正在问」放掉（否则这一栏永远停在「问过了」）
+- `main.rs`（信息链）：`LoadMeta` 拉回标题 + 顺手抓封面图（**同一张只抓一次**，
+  抓图那次不带 cookie）、`SetTitle` / `SetCover` 的表单与**两步顺序**（先图床后封面）、
+  图床失败就别去写封面、配置里是短号时用 `get_info` 给的规范号写标题、
+  没配房间号时一个请求都不发
 - `ui/area_tree.rs`：可见行的拉平（收起 / 展开各一条）、父分区是可停的行、
   到顶 / 到底不绕圈、叶子上 `←→` 不吃键、没配过时全收起、配过时**只展开它所在的那个**
   父分区（三个父分区，另外两个必须收起）、配过的分区没了就退回全收起、
@@ -432,6 +542,15 @@ printf '' > /tmp/smoke.toml
 
 别做任何会改账号状态的操作（登录 / 开播 / 下播 / 改标题 / 改封面），
 也别往真房间刷弹幕（要验就按上面那条规矩来一次）。
+
+**改标题 / 换封面这两条谁来验、怎么验**：这是账号上**看得见**的改动，
+所以只由 tc191 自己在真配置上按回车验（`F6` → `↑↓` 选 → 回车编辑 → 回车提交），
+AI / 别人**不许**代为跑一遍真接口。他验的时候盯这三件事，顺手把结果记进「实测过」：
+
+1. 顶栏那句话是「标题已提交，生效要等几秒」还是「改标题失败：…」（后者要抄下原文）
+2. 换封面时先看顶栏有没有「换封面失败：传图床失败：…」——那说明卡在第一步
+   （图床字段 / 分桶不对），跟封面接口没关系
+3. 提交完看一眼直播间页面自己有没有变（服务端生效通常几秒）
 
 ## 已完成 / 待办
 
@@ -489,6 +608,24 @@ printf '' > /tmp/smoke.toml
 - `ui/mod.rs`：`Wiring` 多两条 channel；开局把 `cfg.area_id` 喂给配置页
 - 31 个新测试（121 个全绿），`cargo clippy --all-targets` 干净
 
+### 已完成（2026-10-03，第五轮：直播间信息栏）
+
+- `api/info.rs`（新）：`check_title`（40 字符）、`update_title`、`upload_image`（multipart）、
+  `update_cover`、`pick_image_url`、`normalize_image_url` / `absolute_image_url`、
+  `expand_home` + `InfoRequest` / `InfoEvent` 两条消息类型
+- `api/client.rs`：`post_multipart`（边界交给 reqwest）、`get_bytes`（封面图，8M 上限、
+  **不带 cookie**）、`main_base()`（图床在主站，测试要能顶掉）
+- `api/room.rs`：`RoomInfo.cover`（`user_cover` 字段）、`room_id` 以服务端回的为准
+  （配置里可能是短号）
+- `main.rs`：`info_task` —— 拉 meta + 抓封面图（同址不重抓）、改标题、
+  **两步换封面**（本地图先上图床）、成功顺手刷新房间信息；短号换成规范号再写
+- `ui/control.rs`：信息栏从骨架变真（提交带 `Action` 出去、40 字按键拦截、
+  `on_info_event` 只动显示状态、进栏自动拉一次 meta）、下半格接上封面预览
+- `ui/cover.rs`（新）：解码 + 区域平均缩图 + 按控件尺寸现采样成半格字符
+- `Cargo.toml`：显式加 `image`（`--no-default-features --features jpeg,png`，
+  它本来就在 qrcode 的依赖树里）
+- 31 个新测试（153 个全绿），`cargo clippy --all-targets` 干净
+
 ### 实测过（真接口）
 
 nav、房间信息（在播/未播两种）、观众榜（3 人 / 50 人两种）、getDanmuInfo（没 -352）、
@@ -544,7 +681,54 @@ parents=12   subs=450   parents_without_children=0
   临时配置里多出 `area_id = 86` / `area_name = "网游/英雄联盟"`，别的字段原样
   —— 「界面 -> 通道 -> 落盘」整条通了。
 
+**封面相关的两个只读探针（2026-10-03，没碰账号上任何东西）**：
+
+```
+GET room/v1/Room/get_info?room_id=6   （空 cookie）
+  title      = '【预告】10月3日德玛西亚杯'
+  user_cover = 'https://i0.hdslb.com/bfs/live/55adc2ec0e24a7f329bf35742472205492b4526b.png'
+  cover      = 字段不存在（None）
+  room_id    = 7734200   ← 配置里那个 6 是短号
+```
+
+也就是说：封面字段确实是 `user_cover`（老文档里的 `cover` 真的不返了），这次拿到的是
+https 的绝对地址（协议相对的形状是 Go 版见过的，这里没见过）；房间号那条也能确认
+「配置里可能写短号」这件事是真的。
+
+```
+GET <上面那个封面地址>  带 BROWSER_HEADERS 那一套（UA / Origin / Referer / accept）
+  → HTTP 200  image/png  206565 字节  470x264 PNG
+```
+
+拿真图跑过一遍 `ui::cover` 的解码 → 缩放 → 采样（临时探针，跑完删了）：
+470×264 → 96×53，画进 60×12 的框是 12 行、每行 51 格 —— 图床不挑我们的请求头，
+`image` 的 png 解码也没问题。
+
+**界面那一半也在临时配置上真跑过**（`-c /tmp/smoke-info2.toml`，`room_id=0`，
+所以整条链一个请求都没发）：`F6` 直接跳到直播间信息栏，右栏画的是
+「▸ 标题 （空）/ 封面 （空）/ 两行说明 / ┌ 当前封面 ┐ 还没有封面」，
+顶栏那条消息是「读不到当前标题 / 封面，可以直接输入：还没设置直播间号（config.toml 里的 room_id）」
+—— 「进栏 -> 要 meta -> 失败只写一句话」这条通着。另外跑过一遍
+「进编辑打字 -> `Esc`」：那一行先跟着按键变、`Esc` 之后回到「（空）」，
+顶栏写「已取消，没有改动」。
+
 ### 还没验过
+
+**第五轮这三个写接口一个都没在真账号上打过**（这是**故意**的：改标题 / 换封面
+都是 tc191 账号上看得见的改动，得他自己按回车验）：
+
+- `room/v1/Room/update`：表单形状、csrf 两个字段、返回的 code / message 都没见过。
+  连「短号 vs 规范号到底哪个能写」也只是按常识挑了规范号（读接口那条已经证实
+  两者确实不是一个数）。
+- `x/upload/web/image`：**一次都没传过**。字段名 / 分桶 / content-type 全是照 Go 版
+  （它实测过）抄的，`image_url` 与 `location` 的优先级、`location` 真的是 http
+  也只见于 Go 版的注释。真传一张之后要回来看 `data` 里到底是哪个字段。
+- `xlive/app-blink/v1/preLive/UpdatePreLiveInfo`：「只带 csrf 就能过、100402 是图片地址
+  不合法」这两条也都是 Go 版的经验，没验过。**特别要注意**：万一这个接口其实也要
+  app 签名（返的是签名错而不是 100402），别急着加签名 —— 先把它回的 code/message
+  记下来再说（`AGENTS.md` 上面第 14 条写的依据就是 Go 版的行为）。
+- 封面预览只验过**假服务器给的**图 + 一张手工抓下来的真图（见上面「实测过」），
+  「从进栏到画出来」这条端到端没在真网络下走过。
 
 - ~~真发一条弹幕~~ —— 2026-10-03 验过了，见上面「实测过」。
 - ~~扫码登录的落地那半段~~ —— **2026-10-03 真机扫过了**（tc191 拿空 cookie 的临时配置扫的）：
@@ -579,19 +763,28 @@ parents=12   subs=450   parents_without_children=0
 1. **`INTERACT_WORD_V2` 收不到**：现在房间发的是 V2，名字在 protobuf 的 `pb` 字段里，
    不是 JSON 的 `uname`。所以「XXX 进入了房间」这类提示目前**不会显示**。
    要显示得手写一小段 protobuf varint/length-delimited 解码（Go 版同样没处理 V2）。
-2. 写操作还差几条：**开播 / 下播 / 改标题 / 改封面 / OBS 联动**。
+2. 写操作还差几条：**开播 / 下播 / 推流码 / OBS 联动**（改标题和换封面第五轮接完了）。
    Go 版的对应实现在 `live/client.go`（app 签名那套 appKey/appSec 是直播姬的，
    和 web 端 WBI 是两码事，别混）。
-   （发弹幕第二轮接完，扫码登录第三轮接完。）
+   （发弹幕第二轮接完，扫码登录第三轮接完，分区栏第四轮，直播间信息栏第五轮。）
+2.0 **第五轮留下的三个口子**（都不影响用，按需接）：
+   - 信息栏没有「重新拉一次当前标题 / 封面」的键：一次运行只自动问一次
+     （拉失败后切走再切回来会重试）。要补就照分区栏那套（回车重试 / F6 重来）。
+   - 封面预览的解码跑在界面的事件循环里：几百 KB 的图几十毫秒，
+     真碰到超大图会卡一帧。要治就把它挪到信息任务里（解完只把缩好的图传过来）。
+   - 预览那张图**抓失败之后不会再自动重抓**（任务那边按地址去重，失败也算「抓过了」，
+     跟 Go 版 `ui/cover` 的 `loaded` 一个口径）：网络抖一下之后要等地址变了
+     （改一次封面 / 重启）才会再试。要治就在失败时不记那个地址。
+   - 「退出登录」还是没有（见 2.2），改标题 / 换封面在没登录时会直接在顶栏说
+     「Cookie 里没有 bili_jct…」，这时得靠临时配置或手工清 cookie 换账号。
 2.1 **第二页还差两栏**：
    - ~~分区栏~~ —— 2026-10-03 第四轮接完了（见上面第 13 条）。剩一个小口子：
      分区表是**每次运行拉一次**（切进这一栏时自动拉，失败了回车重试），
      中途没有「刷新分区表」的键 —— Go 版的 F3 是「手动重来一次」（会重拉，
      代价是丢掉手工展开的状态），要不要补看下一轮怎么定。
-   - 直播间信息栏：选 / 编辑 / `Esc` 还原这套骨架是真的，但**提交是假的**
-     （只把值记在内存里，提示也这么说）。接的时候做两件事：
-     `POST` 改标题（上限 40 字，超了服务端只回一句看不懂的错，界面上先拦）、
-     封面要么给 `.hdslb.com` 链接要么先传图床（别处的地址服务端一律 100402 拒）。
+   - ~~直播间信息栏~~ —— 2026-10-03 第五轮接完了（见上面第 14 条）：改标题、
+     换封面（本地图先传图床）、下半格画当前封面都做了。留下的口子见上面 2.0，
+     以及**这三个写接口一个都没在真账号上验过**（见「还没验过」那一节）。
    - 推流码栏：等开播接完，`F4` 开播 / `F5` 下播的提示再补回 `Tab::Stream::hint`
      （现在特意没写，提示里挂一个按了没反应的键比不写更坑人）。
 2.2 **第二页的账号栏只有「扫码登录」，没有「退出登录」**：想换账号得手工清
@@ -613,5 +806,7 @@ parents=12   subs=450   parents_without_children=0
 - 不要在 `ui/` 里直接发请求，也不要在 `api/` 里画东西
 - 不要把 `ui/qr.rs` 的颜色改成 `Color::Black` / `Color::White`（浅色主题下扫不出来）
 - 不要让第二页抢走弹幕页的 `Tab`，也不要把 `Esc` 接成退出（退出只有 `Ctrl+C`）
+- 不要在 AI 手里跑真的改标题 / 传封面 / 开播（那是账号上看得见的改动）；
+  界面这一半用临时配置 + 空房间号验（见「怎么手工验真接口」最后一节）
 - 不要在登录成功后去动弹幕那条**已经在跑的**连接 —— 换不掉，只能整条重来
 - 不要为了登录把 reqwest 的 `cookie_store` 打开：那跟我们自己管的 Cookie 头是两套账

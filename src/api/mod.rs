@@ -3,6 +3,7 @@
 pub mod area;
 pub mod client;
 pub mod danmaku;
+pub mod info;
 pub mod login;
 pub mod room;
 pub mod send;

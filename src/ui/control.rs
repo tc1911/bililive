@@ -33,7 +33,9 @@ use ratatui::widgets::*;
 
 use super::area_tree::{self, AreaTree, Row};
 use crate::api::area::AreaEvent;
+use crate::api::info::{self, InfoEvent, MAX_TITLE_CHARS};
 use crate::api::login::LoginEvent;
+use crate::ui::cover::Cover;
 use crate::ui::qr;
 
 /// 左栏宽度。16 格 = 边框两格 + 「▸ 直播间信息」12 格 + 一点余量，
@@ -114,6 +116,13 @@ pub enum Action {
     /// 选定了开播分区：把 `area_id` / `area_name` 写回配置文件。
     /// 落盘归 main（界面碰磁盘这件事已经说死了），所以只把这一对传出去。
     PickArea { id: i64, name: String },
+    /// 切进「直播间信息」栏：去 `Room/get_info` 拉一次当前标题 / 封面
+    /// （标题要预填、封面要地址，那一栏自己抓不了图）。一次运行只问一次。
+    LoadRoomMeta,
+    /// 改标题：`POST room/v1/Room/update` 那一下交给 main 的信息任务
+    SetTitle(String),
+    /// 换封面：值可能是本地路径（任务那边先传图床）也可能已经是 hdslb 链接
+    SetCover(String),
 }
 
 /// 分区栏的状态。
@@ -178,6 +187,15 @@ pub struct Control {
     pub title: String,
     /// 直播间信息栏第二行
     pub cover: String,
+    /// 封面预览那一格要显示哪个地址（提交成功后换成本地图走完图床拿到的那一个）
+    cover_url: String,
+    /// 封面预览本身（解码 / 缩放 / 画半格都在 `ui/cover.rs` 里）
+    cover_preview: Cover,
+    /// 正在问 `Room/get_info`：这期间别再问一次
+    info_meta_pending: bool,
+    /// 当前标题 / 封面已经问回来过了。成功之后切栏就不再问；
+    /// 失败**不算问过**（下次切进这一栏会重试，但不会变成循环打接口）。
+    info_meta_loaded: bool,
     /// 分区栏：状态机 + 分区树
     area: AreaState,
     /// 配置里记着的开播分区（`area_id`）。
@@ -203,6 +221,10 @@ impl Default for Control {
             edit: None,
             title: String::new(),
             cover: String::new(),
+            cover_url: String::new(),
+            cover_preview: Cover::default(),
+            info_meta_pending: false,
+            info_meta_loaded: false,
             area: AreaState::Idle,
             saved_area_id: 0,
             saved_area_name: String::new(),
@@ -252,6 +274,25 @@ impl Control {
     pub fn seed_title(&mut self, title: &str) {
         if self.title.is_empty() && !title.is_empty() {
             self.title = title.to_string();
+        }
+    }
+
+    /// 房间信息里那个 `user_cover` 顺手喂给封面那一行和预览。
+    /// 口径跟 `seed_title` 一样：**只填空的**，用户敲了一半的（或者刚改过的）别冲掉。
+    ///
+    /// 光有地址还画不出图 —— 像素是信息任务抓到之后从 `InfoEvent::CoverImage` 送进来的，
+    /// 那一次抓取由「进这一栏时拉一次 get_info」触发（`Action::LoadRoomMeta`）。
+    pub fn seed_cover(&mut self, cover: &str) {
+        if cover.is_empty() {
+            return;
+        }
+        if self.cover.is_empty() {
+            self.cover = cover.to_string();
+        }
+        if self.cover_url.is_empty() {
+            // 接口有时给的是 `//i0.hdslb.com/...`：协议相对的地址扔给 reqwest
+            // 会报「relative URL without a base」，先补成 https（http 的不动）
+            self.cover_url = info::absolute_image_url(cover);
         }
     }
 
@@ -336,6 +377,67 @@ impl Control {
         }
     }
 
+    /// 那一下没能送进信息任务（队列满 / 任务没了）。
+    ///
+    /// 必须把「正在问」的标志放掉：不放的话这一栏就永远停在「问过了」的状态上，
+    /// 用户切走再切回来也不会再问一次（屏幕上什么都不会发生）。
+    pub fn info_request_dropped(&mut self) {
+        self.info_meta_pending = false;
+    }
+
+    /// 信息任务那边来的消息（`Room/get_info` 的结果 / 改标题改封面的结果 / 封面图本身）。
+    ///
+    /// 跟别的几条链一样：只动显示状态，失败只写顶栏那一行，**绝不 panic、绝不退出**。
+    pub fn on_info_event(&mut self, ev: InfoEvent) {
+        match ev {
+            InfoEvent::Meta { title, cover } => {
+                self.info_meta_pending = false;
+                self.info_meta_loaded = true;
+                // 慢网下用户可能已经敲上了，别把人家打的字冲掉（Go 版的 loadTitle 同理）
+                if self.title.is_empty() && !title.is_empty() {
+                    self.title = title;
+                }
+                let cover = info::absolute_image_url(&cover);
+                if self.cover.is_empty() && !cover.is_empty() {
+                    self.cover = cover.clone();
+                }
+                if self.cover_url.is_empty() {
+                    self.cover_url = cover;
+                }
+            }
+            InfoEvent::MetaFailed(err) => {
+                // 读不到**不等于改不了**：输入框照用，人可以直接敲。所以只留一句话，
+                // 而且不置 `info_meta_loaded` —— 下次再切进这一栏会重试一次。
+                self.info_meta_pending = false;
+                self.set_message(format!("读不到当前标题 / 封面，可以直接输入：{err}"));
+            }
+            InfoEvent::Title { title, error } => {
+                // 值按用户填的那个留着（失败也不还原）：他多半想在那个基础上改
+                self.title = title;
+                match error {
+                    None => self.set_message("标题已提交，生效要等几秒"),
+                    Some(e) => self.set_message(format!("改标题失败：{e}")),
+                }
+            }
+            InfoEvent::Cover { cover, error } => match error {
+                None => {
+                    if !cover.is_empty() {
+                        // 真正生效的是这个 hdslb 地址（本地路径走完图床就变成它了），
+                        // 字段里留着用户填的那个路径，预览换成新的那张
+                        self.cover_url = cover;
+                    }
+                    self.set_message("封面已提交，生效要等几秒");
+                }
+                Some(e) => self.set_message(format!("换封面失败：{e}")),
+            },
+            // 图解码不开也只是预览那一格写一句话（`Cover` 自己兜着），界面别处不受影响
+            InfoEvent::CoverImage { url, bytes } => self.cover_preview.set_bytes(&url, &bytes),
+            InfoEvent::CoverImageFailed { url, error } => {
+                self.cover_preview.fail(&url, &error);
+            }
+        }
+    }
+
     /// 喂一个按键。返回这一下有没有被配置页吃掉。
     pub fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> Action {
         // F2 / F3 / F6 是「直接翻开配置页并跳到某一栏」，在**哪一页**都该管用，
@@ -367,8 +469,8 @@ impl Control {
                     return Action::Handled;
                 }
                 KeyCode::Enter => {
-                    self.commit_edit();
-                    return Action::Handled;
+                    // 提交那一下要真把动作带出去（改标题 / 换封面都归信息任务）
+                    return self.commit_edit();
                 }
                 KeyCode::Tab => return self.cycle_tab(1),
                 KeyCode::BackTab => {
@@ -456,6 +558,14 @@ impl Control {
         if self.tab == Tab::Area && matches!(self.area, AreaState::Idle) {
             self.area = AreaState::Loading;
             return Action::LoadAreas;
+        }
+        // 直播间信息栏：没问过就自己去问一次（标题要预填、封面预览要地址）。
+        // 「别覆盖用户敲了一半的」是**收到回复时**才判断的事（`on_info_event`），
+        // 所以这儿不等字段空着 —— 主页那条房间信息链虽然也会预填标题，但它是 30 秒一轮的
+        // 只读链路，不该指望它替这一栏把封面抓回来。
+        if self.tab == Tab::Info && !self.info_meta_pending && !self.info_meta_loaded {
+            self.info_meta_pending = true;
+            return Action::LoadRoomMeta;
         }
         Action::Handled
     }
@@ -545,21 +655,52 @@ impl Control {
         }
     }
 
-    /// 提交当前这一行。
+    /// 提交当前这一行：值留在字段里，真正那一下交给 main 的信息任务。
     ///
-    /// 这轮**不真提交** —— 改标题 / 传封面是下一步。但值要记下来、
-    /// 提示里也得说清楚还没发给 B 站，不然用户以为已经生效了。
-    fn commit_edit(&mut self) {
+    /// 标题在**这儿**再按字符数拦一道（输入时已经拦过：预填、手滑都可能塞进来），
+    /// 服务端超长只回一句谁也看不懂的错。封面留空 = 不改动，**不是错误**。
+    fn commit_edit(&mut self) -> Action {
         let Some(e) = self.edit.take() else {
-            return;
+            return Action::Handled;
         };
         let value = e.text();
-        let name = self.field_name(self.field_idx);
-        self.set_field(self.field_idx, value);
-        self.set_message(format!("{name}改好了，但还没提交给 B 站 —— 提交下一步接"));
+        let idx = self.field_idx;
+        self.set_field(idx, value.clone());
+
+        if idx == 0 {
+            if let Err(err) = info::check_title(&value) {
+                self.set_message(err.to_string());
+                return Action::Handled;
+            }
+            self.set_message(format!("正在提交{}…", self.field_name(idx)));
+            return Action::SetTitle(value);
+        }
+        if value.is_empty() {
+            // 把封面那一行清空多半就是「算了，不换」：照 Go 版的样子说一声就完事
+            self.set_message("封面留空，没有改动");
+            return Action::Handled;
+        }
+        self.set_message(format!("正在处理封面：{value}"));
+        Action::SetCover(value)
     }
 
     fn edit_key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        // 标题上限 40 个字：满了就不再收字（Go 版用的是 InputField 的 SetAcceptanceFunc，
+        // 现象一样 —— 按键没反应，而不是等服务端回一句看不懂的错）。
+        // 判断放在最前面：借用 `self.edit` 的时候没法再调 `self.set_message`。
+        let typing = matches!(code, KeyCode::Char(_))
+            && !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        if typing
+            && self.field_idx == 0
+            && self
+                .edit
+                .as_ref()
+                .is_some_and(|e| e.buf.len() >= MAX_TITLE_CHARS)
+        {
+            self.set_message(format!("标题最多 {MAX_TITLE_CHARS} 个字，已经满了"));
+            return;
+        }
+
         let Some(e) = self.edit.as_mut() else {
             return;
         };
@@ -654,7 +795,7 @@ pub fn draw(f: &mut Frame, c: &Control, area: Rect) {
     f.render_widget(block, content);
     match c.tab {
         Tab::Account => draw_account(f, c, inner),
-        Tab::Info => f.render_widget(Paragraph::new(info_lines(c)), inner),
+        Tab::Info => draw_info(f, c, inner),
         Tab::Area => draw_area(f, c, inner),
         Tab::Stream => draw_placeholder(
             f,
@@ -789,7 +930,41 @@ fn draw_placeholder(f: &mut Frame, area: Rect, name: &str, note: &str) {
     );
 }
 
-fn info_lines(c: &Control) -> Vec<Line<'static>> {
+/// 「直播间信息」栏：上面两行字段（选中的那行带 ▸），中间两行说明，
+/// 剩下的高度全给封面预览 —— 图按这一格的实际大小现采样，终端一拉伸画面自己就跟着变。
+fn draw_info(f: &mut Frame, c: &Control, area: Rect) {
+    let [fields, note, preview] =
+        Layout::vertical([Constraint::Length(2), Constraint::Length(2), Constraint::Fill(1)])
+            .areas(area);
+    f.render_widget(Paragraph::new(info_fields(c)), fields);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "标题上限 40 字；封面填本地图片路径（~ 开头也行）或 .hdslb.com 链接，留空表示不改",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                "本地图会先传 B 站图床，再把地址写进直播间（两步，慢一点）",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]),
+        note,
+    );
+
+    let block = Block::bordered().title(" 当前封面 ");
+    let inner = block.inner(preview);
+    f.render_widget(block, preview);
+    // 终端太小的时候这一格是 0 行：边框画出来就够了，别再往下算
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let lines = c.cover_preview.lines(inner.width, inner.height, &c.cover_url);
+    if !lines.is_empty() {
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+fn info_fields(c: &Control) -> Vec<Line<'static>> {
     let fields = [("标题", c.title.as_str()), ("封面", c.cover.as_str())];
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, (name, value)) in fields.iter().enumerate() {
@@ -817,15 +992,6 @@ fn info_lines(c: &Control) -> Vec<Line<'static>> {
         }
         lines.push(Line::from(spans));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "标题上限 40 字；封面填本地图片路径或 .hdslb.com 链接，留空表示不改",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        "这轮先搭骨架：能选、能打字、Esc 还原；真提交下一步接",
-        Style::default().fg(Color::DarkGray),
-    )));
     lines
 }
 
@@ -905,11 +1071,11 @@ mod tests {
             let action = c.handle_key(KeyCode::Tab, NONE);
             assert_eq!(c.tab(), want);
             // 分区栏一进去就自己去拉表（跟账号栏顺手要一张码是同一个「需要什么显示什么」）；
-            // 别的栏换过去只是空换。
-            if want == Tab::Area {
-                assert_eq!(action, Action::LoadAreas);
-            } else {
-                assert_eq!(action, Action::Handled);
+            // 直播间信息栏同理，去拉一次当前标题 / 封面。别的栏换过去只是空换。
+            match want {
+                Tab::Area => assert_eq!(action, Action::LoadAreas),
+                Tab::Info => assert_eq!(action, Action::LoadRoomMeta),
+                _ => assert_eq!(action, Action::Handled),
             }
         }
         assert_eq!(c.page(), Page::Config, "换栏又不是收起来");
@@ -1076,25 +1242,289 @@ mod tests {
         assert_eq!(c.title, "原标题");
     }
 
-    /// 提交只是「记下来」，还得说清楚没有真的发给 B 站。
-    #[test]
-    fn committing_says_it_has_not_been_sent_yet() {
+    /// 站在「直播间信息」栏上的 Control（已经登录，免得进账号栏顺带要一张码）。
+    /// 直接摆过去：这一组测的是字段那一套按键和事件，不是换栏。
+    fn info_control() -> Control {
         let mut c = logged_in();
-        c.handle_key(KeyCode::BackTab, NONE);
-        c.handle_key(KeyCode::Tab, NONE);
-        c.handle_key(KeyCode::Tab, NONE);
+        c.handle_key(KeyCode::BackTab, NONE); // 翻开配置页
+        c.tab = Tab::Info;
+        c
+    }
+
+    /// 提交那一下：值留在字段里、动作交给信息任务，顶栏立刻说一句「正在提交…」。
+    #[test]
+    fn committing_hands_the_value_to_the_task() {
+        let mut c = info_control();
         c.handle_key(KeyCode::Enter, NONE);
         for ch in "新标题".chars() {
             c.handle_key(KeyCode::Char(ch), NONE);
         }
-        c.handle_key(KeyCode::Enter, NONE);
+        assert_eq!(
+            c.handle_key(KeyCode::Enter, NONE),
+            Action::SetTitle("新标题".to_string())
+        );
         assert!(!c.is_editing());
         assert_eq!(c.title, "新标题");
-        assert!(
-            c.message.contains("还没提交") && c.message.contains("标题"),
-            "{}",
-            c.message
+        assert!(c.message.contains("正在提交标题"), "{}", c.message);
+    }
+
+    /// 两行字段的编辑那套：进编辑 → 改动 → **Esc 还原**、
+    /// 进编辑 → 改动 → **回车提交**，两条路都把值断言一遍。
+    #[test]
+    fn the_two_info_fields_commit_or_cancel() {
+        let mut c = info_control();
+        c.seed_title("原标题");
+
+        // 标题：改动之后 Esc，值要回到进编辑之前的样子
+        c.handle_key(KeyCode::Enter, NONE);
+        assert!(c.is_editing());
+        for ch in "改过的".chars() {
+            c.handle_key(KeyCode::Char(ch), NONE);
+        }
+        assert_eq!(c.title, "原标题改过的", "边打边写回那一行");
+        c.handle_key(KeyCode::Esc, NONE);
+        assert!(!c.is_editing());
+        assert_eq!(c.title, "原标题", "Esc 要还原");
+
+        // 标题：再改一次，这回回车提交 —— 动作带着新值出去
+        c.handle_key(KeyCode::Enter, NONE);
+        for ch in "改过的".chars() {
+            c.handle_key(KeyCode::Char(ch), NONE);
+        }
+        assert_eq!(
+            c.handle_key(KeyCode::Enter, NONE),
+            Action::SetTitle("原标题改过的".to_string())
         );
+        assert_eq!(c.title, "原标题改过的");
+
+        // 封面那一行同理：↓ 选到它，回车进编辑
+        c.handle_key(KeyCode::Down, NONE);
+        assert_eq!(c.field_idx, 1);
+        c.handle_key(KeyCode::Enter, NONE);
+        for ch in "~/图片/新封面.png".chars() {
+            c.handle_key(KeyCode::Char(ch), NONE);
+        }
+        assert_eq!(
+            c.handle_key(KeyCode::Esc, NONE),
+            Action::Handled,
+            "Esc 只是取消编辑，不是提交"
+        );
+        assert_eq!(c.cover, "", "封面本来就空，取消之后还是空");
+
+        c.handle_key(KeyCode::Enter, NONE);
+        for ch in "~/图片/新封面.png".chars() {
+            c.handle_key(KeyCode::Char(ch), NONE);
+        }
+        assert_eq!(c.cover, "~/图片/新封面.png");
+        assert_eq!(
+            c.handle_key(KeyCode::Enter, NONE),
+            Action::SetCover("~/图片/新封面.png".to_string()),
+            "本地路径原样交给任务（~ 由那边展开，界面不碰文件系统）"
+        );
+        assert_eq!(c.cover, "~/图片/新封面.png", "提交之后那一行还是用户填的");
+    }
+
+    /// 标题上限 **40 个字符**：第 41 个按键就不收（中文和 emoji 一样按字符算，不按字节）。
+    /// 服务端超了只回一句看不懂的错，所以要在按键这一层拦住（Go 版是 SetAcceptanceFunc）。
+    #[test]
+    fn the_title_field_refuses_the_forty_first_character() {
+        for ch in ['汉', '😀'] {
+            let mut c = info_control();
+            c.handle_key(KeyCode::Enter, NONE);
+            for _ in 0..MAX_TITLE_CHARS {
+                c.handle_key(KeyCode::Char(ch), NONE);
+            }
+            assert_eq!(c.title.chars().count(), MAX_TITLE_CHARS);
+
+            c.handle_key(KeyCode::Char(ch), NONE);
+            assert_eq!(
+                c.title.chars().count(),
+                MAX_TITLE_CHARS,
+                "第 41 个「{ch}」不该进去"
+            );
+            assert!(c.message.contains("最多 40"), "{}", c.message);
+
+            // 正好 40 个字是能提交的
+            assert_eq!(
+                c.handle_key(KeyCode::Enter, NONE),
+                Action::SetTitle(ch.to_string().repeat(MAX_TITLE_CHARS))
+            );
+
+            // 退一个之后又能再进一个（不是把这一行锁死）
+            let mut c = info_control();
+            c.handle_key(KeyCode::Enter, NONE);
+            for _ in 0..MAX_TITLE_CHARS {
+                c.handle_key(KeyCode::Char(ch), NONE);
+            }
+            c.handle_key(KeyCode::Backspace, NONE);
+            assert_eq!(c.title.chars().count(), MAX_TITLE_CHARS - 1);
+            c.handle_key(KeyCode::Char(ch), NONE);
+            assert_eq!(c.title.chars().count(), MAX_TITLE_CHARS);
+        }
+    }
+
+    /// 空标题不许提交（说一句话就完事，别等服务端拒绝）；封面留空 = 不改动，**不是错误**。
+    #[test]
+    fn an_empty_title_is_refused_and_an_empty_cover_is_a_no_op() {
+        let mut c = info_control();
+        c.handle_key(KeyCode::Enter, NONE);
+        assert_eq!(
+            c.handle_key(KeyCode::Enter, NONE),
+            Action::Handled,
+            "空标题一个请求都不该发"
+        );
+        assert!(c.message.contains("不能为空"), "{}", c.message);
+
+        // 预填进来的超长标题（从别处拷的）也得在提交这一下拦住
+        c.seed_title(&"汉".repeat(MAX_TITLE_CHARS + 1));
+        c.handle_key(KeyCode::Enter, NONE);
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::Handled);
+        assert!(c.message.contains("40"), "{}", c.message);
+
+        let mut c = info_control();
+        c.handle_key(KeyCode::Down, NONE);
+        c.handle_key(KeyCode::Enter, NONE);
+        assert_eq!(
+            c.handle_key(KeyCode::Enter, NONE),
+            Action::Handled,
+            "封面留空 = 不改动，不是错误"
+        );
+        assert!(c.message.contains("没有改动"), "{}", c.message);
+    }
+
+    /// 进这一栏时手上还没有当前标题：自动去 `Room/get_info` 拉一次。
+    /// 拉到过就不再问（别每切一次栏打一次接口）；拉失败过的那次不算拉到，会再试。
+    #[test]
+    fn entering_the_info_tab_asks_for_the_current_meta_once() {
+        let mut c = logged_in();
+        c.handle_key(KeyCode::BackTab, NONE); // 账号栏
+        c.handle_key(KeyCode::Tab, NONE); // 分区栏（顺手拉表，不管它）
+        assert_eq!(
+            c.handle_key(KeyCode::Tab, NONE),
+            Action::LoadRoomMeta,
+            "切进信息栏就该去拉当前标题 / 封面"
+        );
+        assert_eq!(
+            c.handle_key(KeyCode::F(6), NONE),
+            Action::Handled,
+            "还在路上：别再打一次接口"
+        );
+
+        c.on_info_event(InfoEvent::Meta {
+            title: "当前标题".into(),
+            cover: "//i0.hdslb.com/bfs/x.png".into(),
+        });
+        assert_eq!(c.title, "当前标题");
+        assert_eq!(
+            c.cover, "https://i0.hdslb.com/bfs/x.png",
+            "协议相对的地址要补成 https"
+        );
+        c.handle_key(KeyCode::BackTab, NONE); // 回弹幕页
+        assert_eq!(
+            c.handle_key(KeyCode::F(6), NONE),
+            Action::Handled,
+            "拿到过就别再问"
+        );
+
+        // 拉失败：说一句「可以直接输入」，而且**不算拿到过**
+        let mut c = info_control();
+        c.handle_key(KeyCode::BackTab, NONE);
+        assert_eq!(c.handle_key(KeyCode::F(6), NONE), Action::LoadRoomMeta);
+        c.on_info_event(InfoEvent::MetaFailed("网络不可达".into()));
+        assert!(c.message.contains("可以直接输入"), "{}", c.message);
+        assert!(c.message.contains("网络不可达"), "{}", c.message);
+        c.handle_key(KeyCode::BackTab, NONE);
+        assert_eq!(
+            c.handle_key(KeyCode::F(6), NONE),
+            Action::LoadRoomMeta,
+            "失败之后切回来再试一次"
+        );
+        c.on_info_event(InfoEvent::Meta {
+            title: "标题".into(),
+            cover: String::new(),
+        });
+        c.handle_key(KeyCode::BackTab, NONE);
+        assert_eq!(c.handle_key(KeyCode::F(6), NONE), Action::Handled);
+    }
+
+    /// 「那一下没送进信息任务」时要把「正在问」的标志放掉：
+    /// 不放的话这一栏永远停在「问过了」，切走再切回来也不问（屏幕上什么都不发生）。
+    #[test]
+    fn a_dropped_info_request_can_be_asked_again() {
+        let mut c = info_control();
+        c.handle_key(KeyCode::BackTab, NONE);
+        assert_eq!(c.handle_key(KeyCode::F(6), NONE), Action::LoadRoomMeta);
+        c.handle_key(KeyCode::BackTab, NONE);
+        assert_eq!(
+            c.handle_key(KeyCode::F(6), NONE),
+            Action::Handled,
+            "还在路上，别重复问"
+        );
+
+        c.info_request_dropped(); // 界面那边 try_send 失败时走的就是这一下
+        c.handle_key(KeyCode::BackTab, NONE);
+        assert_eq!(
+            c.handle_key(KeyCode::F(6), NONE),
+            Action::LoadRoomMeta,
+            "下没送出去就不该记成「问过了」"
+        );
+    }
+
+    /// 信息任务来的消息只动显示状态：不覆盖用户敲了一半的字、
+    /// 成功失败都只写顶栏那一行、封面图哪怕是垃圾字节也不许把界面带走。
+    #[test]
+    fn info_events_only_touch_the_display_state() {
+        let mut c = info_control();
+
+        // 慢网下用户已经敲上了，回复来了要把人家打的字留着
+        c.handle_key(KeyCode::Enter, NONE);
+        for ch in "我自己的".chars() {
+            c.handle_key(KeyCode::Char(ch), NONE);
+        }
+        c.on_info_event(InfoEvent::Meta {
+            title: "服务端的原标题".into(),
+            cover: "https://i0.hdslb.com/bfs/x.png".into(),
+        });
+        assert_eq!(c.title, "我自己的", "用户敲了一半的字不能被冲掉");
+        assert_eq!(c.cover, "https://i0.hdslb.com/bfs/x.png", "空的那一行该填上");
+
+        c.on_info_event(InfoEvent::Title {
+            title: "新标题".into(),
+            error: None,
+        });
+        assert_eq!(c.title, "新标题");
+        assert!(c.message.contains("已提交"), "{}", c.message);
+
+        // 失败也只是一句话：值留着让人接着改，绝不 panic、绝不退出
+        c.on_info_event(InfoEvent::Title {
+            title: "新标题".into(),
+            error: Some("-111 csrf 校验失败".into()),
+        });
+        assert!(c.message.contains("改标题失败"), "{}", c.message);
+        assert!(c.message.contains("csrf 校验失败"), "{}", c.message);
+        assert_eq!(c.title, "新标题");
+
+        c.on_info_event(InfoEvent::Cover {
+            cover: "https://i0.hdslb.com/bfs/new.png".into(),
+            error: None,
+        });
+        assert!(c.message.contains("封面已提交"), "{}", c.message);
+        c.on_info_event(InfoEvent::Cover {
+            cover: "https://i0.hdslb.com/bfs/new.png".into(),
+            error: Some("100402 图片地址不合法".into()),
+        });
+        assert!(c.message.contains("100402"), "{}", c.message);
+
+        // 封面图：垃圾字节 -> 预览那一格写一句话；抓失败也是
+        c.on_info_event(InfoEvent::CoverImage {
+            url: "https://i0.hdslb.com/bfs/new.png".into(),
+            bytes: b"nope".to_vec(),
+        });
+        c.on_info_event(InfoEvent::CoverImageFailed {
+            url: "https://i0.hdslb.com/bfs/new.png".into(),
+            error: "HTTP 404".into(),
+        });
+        assert_eq!(c.page(), Page::Config, "这些消息不许改页面状态");
     }
 
     /// 登录任务来的消息：成功收掉二维码、失败留个说法、任何一条都不能 panic。

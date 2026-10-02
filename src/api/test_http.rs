@@ -18,7 +18,11 @@ pub struct Request {
     pub query: String,
     /// 键统一小写
     pub headers: HashMap<String, String>,
+    /// body 的 UTF-8 近似（`from_utf8_lossy`）。看表单、看文本够用，
+    /// **二进制（multipart 里那张真图片）会变成问号** —— 要比原始字节就用 `body_raw`。
     pub body: String,
+    /// body 的原始字节。multipart 上传那条链只有它能钉死「文件内容原样传上去了」。
+    pub body_raw: Vec<u8>,
 }
 
 impl Request {
@@ -136,6 +140,7 @@ async fn read_request(sock: &mut TcpStream) -> Option<Request> {
         query,
         headers,
         body: String::from_utf8_lossy(&body).into_owned(),
+        body_raw: body,
     })
 }
 
