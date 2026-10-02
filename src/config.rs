@@ -30,6 +30,12 @@ pub struct Config {
     pub single_line: bool,
     /// 弹幕显示时间
     pub show_time: bool,
+    /// 鼠标滚轮能不能滚弹幕（默认开）。
+    ///
+    /// **默认开的代价**：开了之后终端会把鼠标事件交给程序，终端自己那套
+    /// 「按住拖拽选中文字 / 双击选中一个词」就不管用了 —— 想选中文、复制推流密钥，
+    /// 得**按住 Shift 再拖**（多数终端都留着这个后门）。受不了就在这儿写 false。
+    pub mouse: bool,
 }
 
 fn default_true() -> bool {
@@ -49,6 +55,7 @@ impl Default for Config {
             obs_password: String::new(),
             single_line: true,
             show_time: true,
+            mouse: true,
         }
     }
 }
@@ -212,6 +219,7 @@ mod tests {
             obs_password: "hunter2".into(),
             single_line: false,
             show_time: false,
+            mouse: false,
         };
         cfg.save_to(&path).unwrap();
 
@@ -250,6 +258,7 @@ mod tests {
         assert!(!back.obs_fill);
         assert!(!back.single_line);
         assert!(!back.show_time);
+        assert!(!back.mouse, "滚轮开关也是「别的字段」，不许被顺手改掉");
         let _ = std::fs::remove_file(&path);
     }
 

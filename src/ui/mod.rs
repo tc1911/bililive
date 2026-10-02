@@ -10,9 +10,13 @@ mod cover;
 mod qr;
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -53,11 +57,21 @@ const MAX_LINES: usize = 500;
 /// 输入历史最多记这么多条（跟 Go 版一致，最旧的挤掉）。
 const HISTORY_MAX: usize = 10;
 
+/// 事件循环每一轮醒一次的时间：100 毫秒够弹幕跟手，也不至于空转把 CPU 烧掉。
+const POLL_GAP: Duration = Duration::from_millis(100);
+
+/// 滚轮一格滚几行。三行是「一格看得出来动了、又不至于翻掉半屏」的量。
+///
+/// 滚动**只走鼠标这一条路**：键盘一个键位都不占（`↑↓` 是发送历史、`Home`/`End`
+/// 是行首行尾、`PgUp`/`PgDn` 也一并留给以后），回到底部的办法是「往下滚到底」。
+const WHEEL_LINES: isize = 3;
+
 pub async fn run(
     cfg: Config,
     w: Wiring,
 ) -> Result<()> {
-    let mut terminal = setup()?;
+    let mouse = cfg.mouse;
+    let mut terminal = setup(mouse)?;
     let res = event_loop(&mut terminal, cfg, w).await;
     restore()?;
     res
@@ -101,16 +115,68 @@ pub struct Wiring {
     pub obs_notes: Receiver<String>,
 }
 
-fn setup() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
+/// 鼠标捕获到底还开着没有。
+///
+/// 真终端上的 escape 序列没法在单测里断言，所以单独记一个状态：退出 / panic
+/// 有没有把它还回去，看这个就够 —— 留在捕获状态的话，用户没法用鼠标选中文、直接
+/// 复制推流密钥，终端自己的滚动也废了，只能重开一个终端。
+static MOUSE_CAPTURE: AtomicBool = AtomicBool::new(false);
+
+fn setup(mouse: bool) -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
+    if mouse {
+        set_mouse_capture(true)?;
+    }
+    // panic 之后也得有人收拾终端：默认那套只把消息打到屏幕上，而这时终端还在
+    // alternate screen + raw mode 里，用户看到的是整屏被冲掉、鼠标还被程序吃着。
+    install_panic_hook();
     Ok(Terminal::new(CrosstermBackend::new(out))?)
 }
 
+/// 打开 / 关掉鼠标捕获，顺手记下状态。
+///
+/// 状态**先记、命令后发**：真发不出去（比如 stdout 已经不是终端了）时宁可记成「开着」，
+/// 退出时多发一次 `DisableMouseCapture` —— 关两次没有副作用，反过来漏关才是麻烦。
+fn set_mouse_capture(on: bool) -> Result<()> {
+    MOUSE_CAPTURE.store(on, Ordering::SeqCst);
+    let mut out = stdout();
+    let res = if on {
+        execute!(out, EnableMouseCapture)
+    } else {
+        execute!(out, DisableMouseCapture)
+    };
+    Ok(res?)
+}
+
+/// 把鼠标还回去。**退出和 panic 都走这一个口子** —— 分成两处写，迟早有一处漏掉。
+fn release_mouse() -> Result<()> {
+    set_mouse_capture(false)
+}
+
+#[cfg(test)]
+fn mouse_capture_enabled() -> bool {
+    MOUSE_CAPTURE.load(Ordering::SeqCst)
+}
+
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = restore();
+        prev(info);
+    }));
+}
+
 fn restore() -> Result<()> {
-    execute!(stdout(), LeaveAlternateScreen)?;
-    disable_raw_mode()?;
+    // 鼠标**先还**：raw mode / 备用屏那两下失败也不该把它留在捕获状态里。
+    // 三件都试一遍再报错，别在第一件错掉的时候把后两件跳过。
+    let mouse = release_mouse();
+    let alt = execute!(stdout(), LeaveAlternateScreen);
+    let raw = disable_raw_mode();
+    mouse?;
+    alt?;
+    raw?;
     Ok(())
 }
 
@@ -125,6 +191,29 @@ struct App {
     input: Input,
     /// 第二页（配置页）的状态。网络那半边从不碰它 —— 它只吃 `LoginEvent`。
     control: Control,
+    /// 弹幕区看到哪儿了（粘底 / 上翻钉住）。
+    view: Viewport,
+}
+
+/// 弹幕视口。
+///
+/// 上翻时钉住的是**绝对行号**，不是「离底部还差多少行」：后者在新弹幕进来时会跟着
+/// 底部一起往前走，屏幕上的内容被新来的弹幕一行一行推走 —— 那就不是「钉住」了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Viewport {
+    /// 视口第一行在 `App::lines` 里的下标。粘底时用不上（每帧现算）。
+    top: usize,
+    /// 跟着最新一条走。默认是它，滚到底部会自动回到这一态。
+    follow: bool,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self {
+            top: 0,
+            follow: true,
+        }
+    }
 }
 
 /// 底部那个输入框。
@@ -306,8 +395,80 @@ impl App {
 
         while self.lines.len() > MAX_LINES {
             self.lines.pop_front();
+            // 上翻时钉住的是绝对行号，前面被挤掉一行就得跟着减一：
+            // 不减的话屏幕上的内容会自己往下跳一行 —— 正好是「钉住」的反面。
+            if !self.view.follow {
+                self.view.top = self.view.top.saturating_sub(1);
+            }
         }
     }
+
+    /// 视口第一行。粘底时就是「最后 `rows` 行的第一行」（内容不够一屏时是 0）。
+    fn view_top(&self, rows: usize) -> usize {
+        let max_top = self.lines.len().saturating_sub(rows);
+        if self.view.follow {
+            max_top
+        } else {
+            self.view.top.min(max_top)
+        }
+    }
+
+    /// 视口下面还有多少行没看见 —— 也就是「已上翻多少行」。粘底时是 0。
+    fn hidden_below(&self, rows: usize) -> usize {
+        self.lines
+            .len()
+            .saturating_sub(self.view_top(rows).saturating_add(rows))
+    }
+
+    /// 视口往下走 `delta` 行（看更新的），负数就是往上走（看更旧的）。
+    ///
+    /// 滚到底部**自动恢复「跟随最新」**，这是唯一的回到底部的办法（滚动不占键盘）。
+    /// 内容不满一屏就没什么可滚的，顺手回到跟随态。
+    fn scroll_by(&mut self, delta: isize, rows: usize) {
+        let max_top = self.lines.len().saturating_sub(rows);
+        if max_top == 0 {
+            self.view = Viewport::default();
+            return;
+        }
+        let from = self.view_top(rows);
+        let to = if delta >= 0 {
+            from.saturating_add(delta.unsigned_abs()).min(max_top)
+        } else {
+            from.saturating_sub(delta.unsigned_abs())
+        };
+        self.view.top = to;
+        // 滚到（或者滚过）底部就恢复跟随：用户想看的就是最新那条。
+        self.view.follow = to >= max_top;
+    }
+
+    /// 鼠标事件。只有滚轮、而且指针落在弹幕框里才动视口。
+    ///
+    /// 配置页整屏不是弹幕页，那儿的滚轮**不该动弹幕的视口** —— 切回来发现刚才那几行
+    /// 还在原地，人只会以为自己看错了。
+    fn on_mouse(&mut self, ev: MouseEvent, screen: Rect) {
+        if self.control.page() != control::Page::Main {
+            return;
+        }
+        let delta = match ev.kind {
+            // 往上滚 = 看更旧的 = 视口往回走
+            MouseEventKind::ScrollUp => -WHEEL_LINES,
+            MouseEventKind::ScrollDown => WHEEL_LINES,
+            _ => return,
+        };
+        let area = main_layout(screen).danmaku;
+        if !inside(area, ev.column, ev.row) {
+            return;
+        }
+        self.scroll_by(delta, danmaku_rows(area));
+    }
+}
+
+/// 鼠标落点在不在这一块里。
+///
+/// 自己比而不是用 `Rect::contains`：`MouseEvent` 的 `column` / `row` 本来就是
+/// 从 0 数的终端坐标，直接比少一层来回转换。
+fn inside(area: Rect, column: u16, row: u16) -> bool {
+    column >= area.x && column < area.right() && row >= area.y && row < area.bottom()
 }
 
 /// 系统提示和「进入房间」用灰的，礼物类用洋红，普通弹幕用青色名字。
@@ -383,127 +544,154 @@ async fn event_loop(
 
         terminal.draw(|f| draw(f, &app, &cfg))?;
 
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(KeyEvent {
-                code, modifiers, ..
-            }) = event::read()?
-        {
-            match (code, modifiers) {
-                // 退出只有 Ctrl+C：Esc 是「返回上一层」，别接成退出。
-                // 它排在最前面，所以输入框和配置页都抢不走。
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
-                // 手动刷房间信息（跟 Go 版的 Ctrl+R 一致），不等那 30 秒。
-                // 配置页上按也行 —— Go 版就是全局 capture，两页共用一套。
-                (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-                    room::refresh(&refresh_tx);
-                    app.control.set_message("已请求刷新房间信息");
+        if event::poll(POLL_GAP)? {
+            // 一次把积压的事件收干净再重画：开了鼠标捕获之后终端连「鼠标移动」都送
+            // （crossterm 的 `EnableMouseCapture` 顺带把 1003 也打开了），一条一条处理、
+            // 每处理一条重画一帧的话，鼠标在窗口上划一下就能把 CPU 吃满。
+            loop {
+                match event::read()? {
+                    // 滚轮是弹幕滚动**唯一**的入口（见 `App::on_mouse`），键盘一个键位都不占。
+                    Event::Mouse(m) => {
+                        // 落点按**当下**的终端尺寸算：窗口随时可能被缩放，
+                        // 拿上一帧那个矩形当热区会算错一次。
+                        let size = terminal.size()?;
+                        app.on_mouse(m, Rect::new(0, 0, size.width, size.height));
+                    }
+                    Event::Key(KeyEvent {
+                        code, modifiers, ..
+                    }) => {
+                        match (code, modifiers) {
+                            // 退出只有 Ctrl+C：Esc 是「返回上一层」，别接成退出。
+                            // 它排在最前面，所以输入框和配置页都抢不走。
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
+                            // 手动刷房间信息（跟 Go 版的 Ctrl+R 一致），不等那 30 秒。
+                            // 配置页上按也行 —— Go 版就是全局 capture，两页共用一套。
+                            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                                room::refresh(&refresh_tx);
+                                app.control.set_message("已请求刷新房间信息");
+                            }
+                            // 剩下的先问配置页：Shift+Tab / Tab / Esc / F2… 都归它分派。
+                            // 它说「这一下归我」就到此为止，说「交给主页面」才轮到输入框 ——
+                            // 所以弹幕页上按 Tab 还是输入框的键，抢不走。
+                            _ => match app.control.handle_key(code, modifiers) {
+                                Action::Handled => {}
+                                Action::StartLogin => {
+                                    if login_start.try_send(()).is_err() {
+                                        // 队列只有一格：扫码任务正忙的时候再按就丢。
+                                        // 说一句，比让用户对着一个没反应的键连按强。
+                                        app.control.set_message("扫码任务正忙，等它一下再看看");
+                                    }
+                                }
+                                // 退出登录在会话任务那边落地：清内存凭据、清配置里那一行、
+                                // 重启弹幕那条链路（界面自己一件都不干）。
+                                Action::Logout => {
+                                    if logout_tx.try_send(()).is_err() {
+                                        // 队列一格。没送出去就得把「正在退出」放掉，
+                                        // 不然以后再按会被自己挡住，而那个请求根本不存在。
+                                        app.control.logout_dropped();
+                                    }
+                                }
+                                Action::LoadAreas => {
+                                    if area_tx.try_send(AreaRequest::Load).is_err() {
+                                        // 容量 4，正常按不出这个。真撞上了也得说清楚：
+                                        // 屏幕上还写着「正在拉分区表…」，用户会一直等。
+                                        app.control.set_message("分区任务正忙，等它一下再回车");
+                                    }
+                                }
+                                Action::PickArea { id, name } => {
+                                    if area_tx
+                                        .try_send(AreaRequest::Pick {
+                                            id,
+                                            name: name.clone(),
+                                        })
+                                        .is_err()
+                                    {
+                                        app.control
+                                            .set_message(format!("{name} 没能写进配置（分区任务正忙），再回车试一次"));
+                                    }
+                                }
+                                // 改标题 / 换封面是写操作，全在信息任务那边落地（界面不碰网络）。
+                                // 三条都只有容量 4 的队列，正常按不出「忙」；真撞上了也得说一句，
+                                // 屏幕上还写着「正在提交…」，用户会一直等。
+                                Action::LoadRoomMeta => {
+                                    if info_tx.try_send(InfoRequest::LoadMeta).is_err() {
+                                        // 这一下没送出去，就得把「正在问」的标志放掉：
+                                        // 不然这一栏永远停在那儿等一个不会被发的请求
+                                        app.control.info_request_dropped();
+                                        app.control.set_message("信息任务正忙，等一下再切回这一栏");
+                                    }
+                                }
+                                Action::SetTitle(title) => {
+                                    if info_tx.try_send(InfoRequest::SetTitle(title)).is_err() {
+                                        app.control.set_message("信息任务正忙，这条标题没提交，再回车试一次");
+                                    }
+                                }
+                                Action::SetCover(cover) => {
+                                    if info_tx.try_send(InfoRequest::SetCover(cover)).is_err() {
+                                        app.control.set_message("信息任务正忙，这次换封面没提交，再回车试一次");
+                                    }
+                                }
+                                // 开播那三下都归开播任务。**开播 / 下播都是写操作**：
+                                // 只有走完确认层（`Action::StartLive`）才会发出去。
+                                Action::LoadLiveStatus => {
+                                    if live_tx.try_send(LiveRequest::LoadStatus).is_err() {
+                                        // 这一下没送出去就得把「正在查」放掉：不然那一栏永远停在
+                                        // 「正在查开播状态…」，而那个请求根本不会被发。
+                                        app.control.live_request_dropped("查状态");
+                                    }
+                                }
+                                Action::StartLive { area_v2 } => {
+                                    if live_tx.try_send(LiveRequest::Start { area_v2 }).is_err() {
+                                        app.control.live_request_dropped("开播");
+                                    }
+                                }
+                                Action::StopLive => {
+                                    if live_tx.try_send(LiveRequest::Stop).is_err() {
+                                        app.control.live_request_dropped("下播");
+                                    }
+                                }
+                                Action::ToMain => {
+                                    if let Some(text) = app.input.handle_key(code, modifiers)
+                                        && send_tx.try_send(text.clone()).is_err()
+                                    {
+                                        // 队列满、或者发送端没起来（比如没配房间号）。界面永远不等
+                                        // 发送端，但这条得说清楚没发出去，不然用户对着空气等回显。
+                                        app.push_danmu(
+                                            &DanmuMsg::system(format!("这条没发出去（发送端没起来）：{text}")),
+                                            &cfg,
+                                        );
+                                    }
+                                }
+                            },
+                        }
+                    }
+                    // 缩放 / 粘贴这类事件这一版用不上：丢掉就是，绝不能在这儿 panic
+                    _ => {}
                 }
-                // 剩下的先问配置页：Shift+Tab / Tab / Esc / F2… 都归它分派。
-                // 它说「这一下归我」就到此为止，说「交给主页面」才轮到输入框 ——
-                // 所以弹幕页上按 Tab 还是输入框的键，抢不走。
-                _ => match app.control.handle_key(code, modifiers) {
-                    Action::Handled => {}
-                    Action::StartLogin => {
-                        if login_start.try_send(()).is_err() {
-                            // 队列只有一格：扫码任务正忙的时候再按就丢。
-                            // 说一句，比让用户对着一个没反应的键连按强。
-                            app.control.set_message("扫码任务正忙，等它一下再看看");
-                        }
-                    }
-                    // 退出登录在会话任务那边落地：清内存凭据、清配置里那一行、
-                    // 重启弹幕那条链路（界面自己一件都不干）。
-                    Action::Logout => {
-                        if logout_tx.try_send(()).is_err() {
-                            // 队列一格。没送出去就得把「正在退出」放掉，
-                            // 不然以后再按会被自己挡住，而那个请求根本不存在。
-                            app.control.logout_dropped();
-                        }
-                    }
-                    Action::LoadAreas => {
-                        if area_tx.try_send(AreaRequest::Load).is_err() {
-                            // 容量 4，正常按不出这个。真撞上了也得说清楚：
-                            // 屏幕上还写着「正在拉分区表…」，用户会一直等。
-                            app.control.set_message("分区任务正忙，等它一下再回车");
-                        }
-                    }
-                    Action::PickArea { id, name } => {
-                        if area_tx
-                            .try_send(AreaRequest::Pick {
-                                id,
-                                name: name.clone(),
-                            })
-                            .is_err()
-                        {
-                            app.control
-                                .set_message(format!("{name} 没能写进配置（分区任务正忙），再回车试一次"));
-                        }
-                    }
-                    // 改标题 / 换封面是写操作，全在信息任务那边落地（界面不碰网络）。
-                    // 三条都只有容量 4 的队列，正常按不出「忙」；真撞上了也得说一句，
-                    // 屏幕上还写着「正在提交…」，用户会一直等。
-                    Action::LoadRoomMeta => {
-                        if info_tx.try_send(InfoRequest::LoadMeta).is_err() {
-                            // 这一下没送出去，就得把「正在问」的标志放掉：
-                            // 不然这一栏永远停在那儿等一个不会被发的请求
-                            app.control.info_request_dropped();
-                            app.control.set_message("信息任务正忙，等一下再切回这一栏");
-                        }
-                    }
-                    Action::SetTitle(title) => {
-                        if info_tx.try_send(InfoRequest::SetTitle(title)).is_err() {
-                            app.control.set_message("信息任务正忙，这条标题没提交，再回车试一次");
-                        }
-                    }
-                    Action::SetCover(cover) => {
-                        if info_tx.try_send(InfoRequest::SetCover(cover)).is_err() {
-                            app.control.set_message("信息任务正忙，这次换封面没提交，再回车试一次");
-                        }
-                    }
-                    // 开播那三下都归开播任务。**开播 / 下播都是写操作**：
-                    // 只有走完确认层（`Action::StartLive`）才会发出去。
-                    Action::LoadLiveStatus => {
-                        if live_tx.try_send(LiveRequest::LoadStatus).is_err() {
-                            // 这一下没送出去就得把「正在查」放掉：不然那一栏永远停在
-                            // 「正在查开播状态…」，而那个请求根本不会被发。
-                            app.control.live_request_dropped("查状态");
-                        }
-                    }
-                    Action::StartLive { area_v2 } => {
-                        if live_tx.try_send(LiveRequest::Start { area_v2 }).is_err() {
-                            app.control.live_request_dropped("开播");
-                        }
-                    }
-                    Action::StopLive => {
-                        if live_tx.try_send(LiveRequest::Stop).is_err() {
-                            app.control.live_request_dropped("下播");
-                        }
-                    }
-                    Action::ToMain => {
-                        if let Some(text) = app.input.handle_key(code, modifiers)
-                            && send_tx.try_send(text.clone()).is_err()
-                        {
-                            // 队列满、或者发送端没起来（比如没配房间号）。界面永远不等
-                            // 发送端，但这条得说清楚没发出去，不然用户对着空气等回显。
-                            app.push_danmu(
-                                &DanmuMsg::system(format!("这条没发出去（发送端没起来）：{text}")),
-                                &cfg,
-                            );
-                        }
-                    }
-                },
+                // 队列空了就回去画下一帧，别在这儿空转
+                if !event::poll(Duration::ZERO)? {
+                    break;
+                }
             }
         }
     }
 }
 
-fn draw(f: &mut Frame, app: &App, _cfg: &Config) {
-    // 第二页占满整屏：主页面那套一格里都不留（Go 版是 Pages 切换，一个意思）。
-    if app.control.page() == control::Page::Config {
-        control::draw(f, &app.control, f.area());
-        return;
-    }
+/// 主页面各块的矩形。
+///
+/// 画图（`draw`）和「鼠标落在哪一块」（滚轮的热区）共用这一份 ——
+/// 两边各算一次的话，热区跟眼睛看到的框迟早对不上。
+#[derive(Debug, Clone, Copy)]
+struct MainLayout {
+    header: Rect,
+    info: Rect,
+    viewers: Rect,
+    danmaku: Rect,
+    status: Rect,
+    input: Rect,
+}
 
-    let area = f.area();
+fn main_layout(area: Rect) -> MainLayout {
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(HEADER_ROWS),
         Constraint::Fill(1),
@@ -518,12 +706,35 @@ fn draw(f: &mut Frame, app: &App, _cfg: &Config) {
     let [status, input] =
         Layout::horizontal([Constraint::Ratio(1, 3), Constraint::Fill(1)]).areas(footer);
 
-    f.render_widget(banner(), header);
-    f.render_widget(info_panel(app), info);
-    f.render_widget(viewers_panel(app), viewers);
-    f.render_widget(danmaku_panel(app, right), right);
-    f.render_widget(stream_panel(app, status.width), status);
-    f.render_widget(input_panel(app), input);
+    MainLayout {
+        header,
+        info,
+        viewers,
+        danmaku: right,
+        status,
+        input,
+    }
+}
+
+/// 弹幕框里能放几行字（上下边框各占一行）。
+fn danmaku_rows(area: Rect) -> usize {
+    area.height.saturating_sub(2) as usize
+}
+
+fn draw(f: &mut Frame, app: &App, _cfg: &Config) {
+    // 第二页占满整屏：主页面那套一格里都不留（Go 版是 Pages 切换，一个意思）。
+    if app.control.page() == control::Page::Config {
+        control::draw(f, &app.control, f.area());
+        return;
+    }
+
+    let l = main_layout(f.area());
+    f.render_widget(banner(), l.header);
+    f.render_widget(info_panel(app), l.info);
+    f.render_widget(viewers_panel(app), l.viewers);
+    danmaku_panel(f, app, l.danmaku);
+    f.render_widget(stream_panel(app, l.status.width), l.status);
+    f.render_widget(input_panel(app), l.input);
 }
 
 fn banner() -> Paragraph<'static> {
@@ -603,13 +814,74 @@ fn viewers_panel(app: &App) -> Paragraph<'static> {
     Paragraph::new(lines).block(Block::bordered().title(title))
 }
 
-/// 弹幕区永远显示**最后**几行 —— 进来的新弹幕就在眼前，不用去翻页。
-fn danmaku_panel(app: &App, area: Rect) -> Paragraph<'static> {
+/// 弹幕区：粘底时看**最后**几行（进来的新弹幕就在眼前），上翻之后钉在那一行上
+/// （`Viewport`），右边贴着一条滚动条。
+fn danmaku_panel(f: &mut Frame, app: &App, area: Rect) {
     // 框的上下边框各占一行，剩下多少行就能放多少行字。
-    let height = area.height.saturating_sub(2) as usize;
-    let start = app.lines.len().saturating_sub(height);
-    let visible: Vec<Line<'static>> = app.lines.iter().skip(start).cloned().collect();
-    Paragraph::new(visible).block(Block::bordered().title(" 弹幕们 "))
+    let rows = danmaku_rows(area);
+    let top = app.view_top(rows);
+    let visible: Vec<Line<'static>> = app.lines.iter().skip(top).take(rows).cloned().collect();
+
+    // 上翻时必须说一声：不然用户对着一屏旧弹幕，以为程序卡住了。
+    // 回到底部的办法只有一个（往下滚到底），这句话就把它一起说了。
+    let hidden = app.hidden_below(rows);
+    let title = if hidden > 0 {
+        format!(" 弹幕们 · 已上翻 {hidden} 行 · 滚到底恢复跟随 ")
+    } else {
+        " 弹幕们 ".to_string()
+    };
+
+    f.render_widget(
+        Paragraph::new(visible).block(Block::bordered().title(title)),
+        area,
+    );
+    draw_scrollbar(f, area, app.lines.len(), rows, top);
+}
+
+/// 弹幕框右边界**内侧**那一条：`█` 是滑块、`│` 是轨道（跟浏览器一条意思）。
+///
+/// 内容不满一屏就干脆不画 —— 画一条占满的轨道，只会让人以为下面还有东西。
+fn draw_scrollbar(f: &mut Frame, area: Rect, total: usize, rows: usize, top: usize) {
+    let track = area.height.saturating_sub(2) as usize;
+    // 窄到连「右边框内侧那一格」都不存在就不画：下面那个 `right() - 2` 在一列宽的框上
+    // 会下溢（debug 下直接 panic）。终端真能被拖成这种怪尺寸。
+    if area.width < 3 {
+        return;
+    }
+    let Some((start, len)) = thumb(track, total, rows, top) else {
+        return;
+    };
+    // 贴着右边框的那一格。画在图之后，所以长弹幕被它压住半格也算「盖在上面」的意思。
+    let x = area.right() - 2;
+    let buf = f.buffer_mut();
+    for i in 0..track {
+        let on_thumb = i >= start && i < start + len;
+        let (ch, color) = if on_thumb {
+            ("█", Color::Gray)
+        } else {
+            ("│", Color::DarkGray)
+        };
+        buf.set_string(
+            x,
+            area.y + 1 + i as u16,
+            ch,
+            Style::default().fg(color),
+        );
+    }
+}
+
+/// 滑块在轨道里的（起点，长度）。内容不满一屏就没有滚动条（`None`）。
+///
+/// 单拆出来是为了能直接断言「顶 / 中 / 底」三个位置，不用去数屏幕上的格子。
+fn thumb(track: usize, total: usize, rows: usize, top: usize) -> Option<(usize, usize)> {
+    if track == 0 || rows == 0 || total <= rows {
+        return None;
+    }
+    // 滑块至少一格（内容再长也得抓得住），最长就是整条轨道
+    let len = (track * rows / total).clamp(1, track);
+    let max_top = total - rows;
+    let start = (track - len) * top.min(max_top) / max_top;
+    Some((start, len))
 }
 
 fn stream_panel(app: &App, width: u16) -> Paragraph<'static> {
@@ -726,6 +998,54 @@ mod tests {
         s.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
+    /// 一个滚轮事件。落点先给 (0,0)，要用的测试自己挪到弹幕框里。
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// 一屏弹幕 + 一块固定的屏幕矩形。
+    fn screen_with_danmu(n: usize) -> (App, Config, Rect) {
+        let cfg = Config::default();
+        let mut app = App::default();
+        for i in 0..n {
+            app.push_danmu(&danmu(format!("人{i}"), format!("第{i}条")), &cfg);
+        }
+        (app, cfg, Rect::new(0, 0, 120, 30))
+    }
+
+    /// 把滚轮打进弹幕框里：热点就是 `main_layout` 算出来的那一块（跟画图同一个口径）。
+    fn wheel_at(app: &mut App, screen: Rect, kind: MouseEventKind) {
+        let area = main_layout(screen).danmaku;
+        let mut ev = wheel(kind);
+        ev.column = area.x + 1;
+        ev.row = area.y + 1;
+        app.on_mouse(ev, screen);
+    }
+
+    /// 弹幕框里那条滚动条的那一列（`█` / `│`），直接从缓冲区坐标上读。
+    ///
+    /// 不能拿 `render` 拼出来的字符串去数字符：中文这类宽字符在缓冲区里会多占一格
+    /// （那半格是空 symbol），从字符串里数格子会被它骗。
+    fn scrollbar_column(app: &App, cfg: &Config, width: u16, height: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| draw(f, app, cfg)).unwrap();
+        let l = main_layout(Rect::new(0, 0, width, height));
+        let buf = term.backend().buffer();
+        let x = l.danmaku.right() - 2;
+        (l.danmaku.y + 1..l.danmaku.bottom() - 1)
+            .map(|y| {
+                buf.cell((x, y))
+                    .map(|c| c.symbol().to_string())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
     fn danmu(author: String, content: String) -> DanmuMsg {
         DanmuMsg {
             author,
@@ -751,6 +1071,217 @@ mod tests {
             "最新那条要看得见"
         );
         assert!(!flat(&out).contains(&flat("第0条")), "最早那条已经被挤掉了");
+    }
+
+    // ------------------------------------------------------------ 弹幕滚动（鼠标滚轮）
+
+    /// 粘底：停在底部时新弹幕跟着走（默认态，也是看直播的正常状态）。
+    #[test]
+    fn the_viewport_follows_new_danmaku_at_the_bottom() {
+        let (mut app, cfg, screen) = screen_with_danmu(60);
+        let rows = danmaku_rows(main_layout(screen).danmaku);
+        assert_eq!(app.view_top(rows), 60 - rows, "默认粘底：看最后几行");
+        assert_eq!(app.hidden_below(rows), 0, "粘底时没有「已上翻」这回事");
+
+        app.push_danmu(&danmu("人x".into(), "新来的".into()), &cfg);
+        assert_eq!(app.view_top(rows), 61 - rows, "新弹幕进来，视口跟着走");
+    }
+
+    /// 滚轮一格三行；上翻之后**钉住**：新来的弹幕不许把视口踹回底部。
+    #[test]
+    fn scrolling_up_pins_the_viewport_against_new_danmaku() {
+        let (mut app, cfg, screen) = screen_with_danmu(60);
+        let rows = danmaku_rows(main_layout(screen).danmaku);
+        let bottom = 60 - rows;
+
+        wheel_at(&mut app, screen, MouseEventKind::ScrollUp);
+        assert_eq!(
+            app.view_top(rows),
+            bottom - WHEEL_LINES as usize,
+            "一格三行"
+        );
+        assert_eq!(app.hidden_below(rows), 3, "标题要能数出「已上翻几行」");
+
+        let pinned = app.view_top(rows);
+        for i in 0..5 {
+            app.push_danmu(&danmu(format!("新人{i}"), "新".into()), &cfg);
+        }
+        assert_eq!(app.view_top(rows), pinned, "上翻之后新弹幕不许推走视口");
+        assert_eq!(app.hidden_below(rows), 8, "新来的都算在「下面还有几行」里");
+    }
+
+    /// 滚回底部自动恢复跟随 —— 这是唯一的回到底部的办法（键盘一个键都不占）。
+    #[test]
+    fn scrolling_back_to_the_bottom_resumes_following() {
+        let (mut app, cfg, screen) = screen_with_danmu(60);
+        let rows = danmaku_rows(main_layout(screen).danmaku);
+
+        wheel_at(&mut app, screen, MouseEventKind::ScrollUp);
+        wheel_at(&mut app, screen, MouseEventKind::ScrollUp);
+        assert!(app.hidden_below(rows) > 0, "这时候是钉住的");
+
+        wheel_at(&mut app, screen, MouseEventKind::ScrollDown);
+        wheel_at(&mut app, screen, MouseEventKind::ScrollDown);
+        assert_eq!(app.hidden_below(rows), 0, "滚到底就该恢复跟随");
+
+        // 恢复了跟随，新弹幕就重新跟着走了
+        app.push_danmu(&danmu("人x".into(), "新来的".into()), &cfg);
+        assert_eq!(app.view_top(rows), 61 - rows);
+    }
+
+    /// 一路上滚到顶就停住：不绕回去、也不算成负数。
+    #[test]
+    fn scrolling_up_stops_at_the_oldest_line() {
+        let (mut app, _, screen) = screen_with_danmu(60);
+        let rows = danmaku_rows(main_layout(screen).danmaku);
+        for _ in 0..50 {
+            wheel_at(&mut app, screen, MouseEventKind::ScrollUp);
+        }
+        assert_eq!(app.view_top(rows), 0, "到顶就停在第一行");
+        assert_eq!(app.hidden_below(rows), 60 - rows, "下面那些都还没看见");
+
+        // 再往下滚一点点也不许跳过界
+        wheel_at(&mut app, screen, MouseEventKind::ScrollDown);
+        assert_eq!(app.view_top(rows), WHEEL_LINES as usize);
+    }
+
+    /// 内容不满一屏：没什么可滚的，滚动条也不画。
+    #[test]
+    fn a_short_list_has_nothing_to_scroll_and_no_scrollbar() {
+        let (mut app, cfg, screen) = screen_with_danmu(3);
+        let rows = danmaku_rows(main_layout(screen).danmaku);
+        wheel_at(&mut app, screen, MouseEventKind::ScrollUp);
+        assert_eq!(app.view_top(rows), 0);
+        assert_eq!(app.hidden_below(rows), 0);
+
+        let col = scrollbar_column(&app, &cfg, 120, 30);
+        assert_eq!(col.trim(), "", "不满一屏不该画滚动条：{col:?}");
+        assert_eq!(thumb(17, 3, 17, 0), None);
+    }
+
+    /// 滚动条：内容满了之后滑块在顶 / 中 / 底三个位置各对一次。
+    #[test]
+    fn scrollbar_thumb_sits_where_the_browser_would_put_it() {
+        // 轨道 10 格、内容 100 行、一屏 10 行
+        assert_eq!(thumb(10, 100, 10, 0), Some((0, 1)), "最上面：滑块贴着顶");
+        assert_eq!(thumb(10, 100, 10, 45), Some((4, 1)), "中间");
+        assert_eq!(thumb(10, 100, 10, 90), Some((9, 1)), "最下面：滑块贴着底");
+        // 内容长、轨道也长的时候滑块跟着变长（一屏占的比例）
+        assert_eq!(thumb(10, 20, 10, 0), Some((0, 5)));
+        assert_eq!(thumb(10, 20, 10, 10), Some((5, 5)));
+        // 内容不满一屏 / 没地方画：没有滚动条
+        assert_eq!(thumb(10, 5, 10, 0), None);
+        assert_eq!(thumb(0, 100, 10, 0), None);
+        assert_eq!(thumb(10, 100, 0, 0), None);
+        // 到头了再多滚也不会把滑块推出轨道
+        assert_eq!(thumb(10, 100, 10, 999), Some((9, 1)));
+    }
+
+    /// 滑块真的画在那个位置上（从缓冲区里读回来），而且粘底时它在最下面。
+    #[test]
+    fn the_rendered_scrollbar_tracks_the_viewport() {
+        let (mut app, cfg, screen) = screen_with_danmu(60);
+        let rows = danmaku_rows(main_layout(screen).danmaku);
+
+        // 60 行 / 一屏 17 行 -> 轨道 17 格，滑块占 17*17/60 = 4 格
+        let col = scrollbar_column(&app, &cfg, 120, 30);
+        assert_eq!(col.chars().count(), 17, "轨道就是框里那些行：{col:?}");
+        assert_eq!(col.chars().filter(|c| *c == '█').count(), 4, "{col:?}");
+        assert!(col.ends_with("████"), "粘底时滑块贴着最下面：{col:?}");
+        assert!(col.starts_with('│'), "上面那截是轨道：{col:?}");
+
+        // 上翻到最顶：滑块跑到最上面
+        app.scroll_by(-999, rows);
+        let col = scrollbar_column(&app, &cfg, 120, 30);
+        assert!(col.starts_with("████"), "到顶时滑块贴着最上面：{col:?}");
+
+        // 中间（22 行，不是滚轮的整倍数，顺手钉一下任意位置也算得对）
+        app.scroll_by(22, rows);
+        let col = scrollbar_column(&app, &cfg, 120, 30);
+        assert_eq!(col.chars().position(|c| c == '█'), Some(6), "{col:?}");
+    }
+
+    /// 上翻的时候画面上要说明白「现在看的不是最新」，以及怎么回去。
+    #[test]
+    fn the_title_says_how_far_up_you_are() {
+        let (mut app, cfg, screen) = screen_with_danmu(60);
+        let bottom = flat(&render(&app, &cfg, 120, 30));
+        assert!(bottom.contains(&flat("弹幕们")), "粘底时标题还是老样子");
+        assert!(!bottom.contains(&flat("已上翻")), "没上翻就别写这句");
+
+        wheel_at(&mut app, screen, MouseEventKind::ScrollUp);
+        let out = flat(&render(&app, &cfg, 120, 30));
+        assert!(out.contains(&flat("已上翻 3 行")), "{out}");
+        assert!(out.contains(&flat("滚到底恢复跟随")), "{out}");
+    }
+
+    /// 滚动这件事**完全不碰键盘**：`↑↓` 是发送历史、`Home`/`End` 是行首行尾，
+    /// `PgUp`/`PgDn` 也一并留着。这条测试就是拦「以后顺手加个键位」的 ——
+    /// 谁加了，它先红在这儿。
+    #[test]
+    fn no_keyboard_key_scrolls_the_danmaku() {
+        let (mut app, _, screen) = screen_with_danmu(60);
+        let rows = danmaku_rows(main_layout(screen).danmaku);
+        let bottom = app.view_top(rows);
+
+        for (code, mods) in [
+            (KeyCode::PageUp, KeyModifiers::NONE),
+            (KeyCode::PageDown, KeyModifiers::NONE),
+            (KeyCode::Home, KeyModifiers::NONE),
+            (KeyCode::End, KeyModifiers::NONE),
+            (KeyCode::Home, KeyModifiers::CONTROL),
+            (KeyCode::End, KeyModifiers::CONTROL),
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::Down, KeyModifiers::NONE),
+        ] {
+            // 走的正是 `event_loop` 里键盘那条路：先问配置页，它说「交给主页面」才轮到输入框。
+            // 这两处都没有「滚动」这个概念，视口因此一格都不该动。
+            if app.control.handle_key(code, mods) == control::Action::ToMain {
+                let _ = app.input.handle_key(code, mods);
+            }
+            assert_eq!(app.view_top(rows), bottom, "{code:?} 不该滚动弹幕");
+        }
+    }
+
+    /// 指针不在弹幕框里（落在观众榜 / 输入框上）不该动视口。
+    #[test]
+    fn the_wheel_only_works_inside_the_danmaku_box() {
+        let (mut app, _, screen) = screen_with_danmu(60);
+        let l = main_layout(screen);
+        let rows = danmaku_rows(l.danmaku);
+        let bottom = app.view_top(rows);
+
+        for area in [l.viewers, l.input, l.info, l.status, l.header] {
+            let mut ev = wheel(MouseEventKind::ScrollUp);
+            ev.column = area.x + 1;
+            ev.row = area.y + 1;
+            app.on_mouse(ev, screen);
+        }
+        assert_eq!(app.view_top(rows), bottom, "弹幕框外面的滚轮不归它管");
+    }
+
+    /// 配置页上滚轮不该动弹幕：切回来发现视口自己动了，人只会以为自己看错了。
+    #[test]
+    fn the_wheel_does_nothing_on_the_config_page() {
+        let (mut app, _, screen) = screen_with_danmu(60);
+        let rows = danmaku_rows(main_layout(screen).danmaku);
+        let bottom = app.view_top(rows);
+
+        // Shift+Tab 翻开配置页（弹幕页的键盘路径里就那么一个键归配置页管）
+        app.control
+            .handle_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        wheel_at(&mut app, screen, MouseEventKind::ScrollUp);
+        assert_eq!(app.view_top(rows), bottom, "配置页上不该动弹幕");
+    }
+
+    /// 退出（以及 panic，走的是同一个 `release_mouse`）必须把鼠标捕获还回去。
+    /// 留在捕获状态里，用户没法用鼠标选中文、直接复制推流密钥，终端自己的滚动也废了。
+    #[test]
+    fn leaving_turns_the_mouse_capture_back_off() {
+        set_mouse_capture(true).unwrap();
+        assert!(mouse_capture_enabled(), "开了就该记着");
+        release_mouse().unwrap();
+        assert!(!mouse_capture_enabled(), "退出时没把鼠标还回去");
     }
 
     #[test]
@@ -832,7 +1363,17 @@ mod tests {
         let mut app = App::default();
         app.push_danmu(&danmu("小明".into(), "你好".into()), &cfg);
         app.room = Some(RoomInfo::new(1));
-        for (w, h) in [(20u16, 8u16), (40, 12), (5, 5), (1, 1)] {
+        for (w, h) in [(20u16, 8u16), (40, 12), (5, 5), (1, 1), (1, 20), (2, 20), (3, 14)] {
+            let _ = render(&app, &cfg, w, h);
+        }
+
+        // 上面那些尺寸下弹幕还不满一屏,滚动条那一段代码根本没走到。
+        // 塞够一屏再来一遍:右边界内侧那一格是 `right() - 2` 算出来的,
+        // 一列宽的终端上这个减法会下溢(debug 下直接 panic)。
+        for i in 0..60 {
+            app.push_danmu(&danmu(format!("人{i}"), format!("第{i}条")), &cfg);
+        }
+        for (w, h) in [(1u16, 20u16), (2, 20), (3, 20), (4, 20), (120, 14)] {
             let _ = render(&app, &cfg, w, h);
         }
     }

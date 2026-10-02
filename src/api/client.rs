@@ -151,6 +151,14 @@ impl BiliClient {
         *self.nav.lock().await = None;
     }
 
+    /// 手上那份 Cookie 串（原样）。
+    ///
+    /// 扫码登录拿到新字段时要把它当**底**：这一趟没重发的那些（`buvid3` 这类设备标识）
+    /// 不能因为「这次响应里没有」就被洗掉。
+    pub async fn raw_cookie(&self) -> String {
+        self.auth.lock().await.raw.clone()
+    }
+
     /// 发一次 GET，返回**整个**响应体（不判 code）。
     ///
     /// 有的接口 `code != 0` 也照样给数据 —— nav 没登录时返 `-101`，但 `wbi_img` 是齐的，
@@ -536,6 +544,36 @@ mod tests {
     fn cookie_value_strips_control_chars() {
         assert_eq!(cookie_value("a=1; bili_jct=x\r\ny; c=2", "bili_jct").as_deref(), Some("xy"));
         assert_eq!(cookie_value("  bili_jct = spaced  ", "bili_jct").as_deref(), Some("spaced"));
+    }
+
+    /// 发请求带的是**整罐**：配置里抄进来多少字段就带多少，一个都不许被挑掉。
+    ///
+    /// 发请求这半边本来就是原串直发，但这条得钉住 —— 以后谁顺手在这儿过滤一下，
+    /// 风控立刻又会觉得我们是台新设备。
+    #[tokio::test]
+    async fn the_whole_jar_goes_out_on_every_request() {
+        let srv = test_http::start(|_| {
+            (
+                200,
+                r#"{"code":0,"message":"0","data":{}}"#.to_string(),
+            )
+        })
+        .await;
+        let c = BiliClient::new(
+            "SESSDATA=s; bili_jct=t; buvid3=E2C4D3-1A2B_9%2Bx:y; b_nut=1790981010",
+        )
+        .unwrap();
+        c.get_api(&format!("{}/x", srv.base)).await.unwrap();
+
+        let cookie = srv.hits()[0].header("cookie").expect("该带 Cookie").to_string();
+        for want in [
+            "SESSDATA=s",
+            "bili_jct=t",
+            "buvid3=E2C4D3-1A2B_9%2Bx:y",
+            "b_nut=1790981010",
+        ] {
+            assert!(cookie.contains(want), "少了 {want}：{cookie}");
+        }
     }
 
     /// 配置里的 Cookie 脏了只能退化成「没登录」，绝不能让整个 TUI 崩掉：

@@ -17,6 +17,8 @@
 `F4` 开播（先过确认层）/ `F5` 下播，推流码栏摆服务器 / 密钥 / 完整 URL，
 开播成功后通过 obs-websocket 把第一路 rtmp 填进 OBS 的「设置 → 推流」
 （**只管填，绝不代按「开始推流」**，见第 16 条）。
+弹幕栏能往上翻了（**只有鼠标滚轮**，上翻之后钉住、右边界内侧一条滚动条，
+见第 19 条）；cookie 改成**整罐**存取，不再挑字段（见第 18 条）。
 
 **还没在真账号上验过的**：`startLive` / `stopLive`（AI 一律不许真开播）、
 app 签名只有假服务器覆盖、OBS 联动一次都没连过真 OBS。
@@ -48,8 +50,11 @@ cargo run                # 跑 TUI（Ctrl+R 手动刷房间信息，Ctrl+C 退�
 | `F5` | 下播（不用确认） | 同上 |
 | `Ctrl+R` | 立刻刷房间信息 | 同上（两页都能按） |
 | `Ctrl+C` | 退出（唯一出口） | 退出 |
+| `鼠标滚轮` | **只认它**：指针落在弹幕框里时，一格滚 3 行（见第 19 条） | 什么都不做（不许动弹幕的视口） |
 
 `F4` / `F5` 跟 `Ctrl+R` 一样是**全局**的：弹幕页上按也管用（Go 版是全局 capture）。
+**滚动没有键盘键位**：`↑↓`（发送历史）、`Home`/`End`（行首行尾）、`PgUp`/`PgDn` 一个都不占，
+回到底部的办法只有「往下滚到底」。
 确认层（居中带边框、默认落在「取消」）**开播和退出登录共用**，规矩一条都不许变：
 `Tab` / `←→` 选按钮、`回车` 执行选中的那个、`Esc` 取消。开着的时候别的键什么都不认 ——
 漏到下面就会变成「换栏」「收起配置页」，屏上那个框还开着、其实已经没人管它了。
@@ -231,7 +236,8 @@ Go 版是写死 30 秒，那是历史包袱，不要照抄。
 
 ### 8. 界面上的死规矩
 
-- 弹幕列表**有上限**（`MAX_LINES = 500` 行），只显示最后几行 —— 开一整天不能无限长
+- 弹幕列表**有上限**（`MAX_LINES = 500` 行），默认粘底、只看最后几行 —— 开一整天
+  不能无限长；往上翻能看旧的（**只有滚轮**，键位一个都不占，见第 19 条）
 - 单行 / 多行、显不显示时间，跟 `config.toml` 的 `single_line` / `show_time` 走
 - 多行模式下同一个人在同一分钟连着说话不重打名字（跟 Go 版行为一致）
 - 观众榜前三名 👑🥈🥉
@@ -682,6 +688,79 @@ Hello(op 0) -> Identify(op 1) -> Identified(op 2) -> Request(op 6) -> Response(o
 （拿空串当暗号，读的人得猜）；也不要让界面自己去清配置 / 清凭据 ——
 界面只发一个 `Action::Logout`，落盘和重启全在 `session_task` 那边。
 
+### 18. cookie 整罐存（连接稳定性）
+
+**为什么**：老做法是一张白名单 —— 只把 `SESSDATA` / `bili_jct` / `DedeUserID` /
+`DedeUserID__ckMd5` / `sid` 五个字段写进 `config.toml`。于是 `buvid3` 这类
+**设备标识**每次重启都丢，程序在服务端眼里每次都是台**陌生设备**，
+弹幕 / 房间信息那些接口的风控看的正是它们 —— 现象就是时不时莫名其妙地断。
+整罐存之后 B 站加什么新字段都自动跟上，不用再改代码。
+
+**怎么存**：`api/login.rs` 里那三个纯函数是一处，谁都得从这儿走。
+
+- `cookies_from_set_cookie`：一条 `Set-Cookie` 收一个 cookie，**不挑名字**；
+  只取第一个 `=` 到第一个 `;` 之间那一段（再往后是 `Path` / `Domain` / `Expires`
+  这些属性，当成值存进去下次服务端就不认了）；空值不要，`deleted` 不要
+  （那是服务端在**清**这个 cookie）。Set-Cookie 的值是**原样**的，**不解百分号编码**。
+- `cookies_from_redirect`：跳转 URL 那条**兜底**路（`Set-Cookie` 被中间几跳吃掉时用）。
+  query 要解一次百分号编码（`%2C` 是 SESSDATA 里的逗号），但要挡掉
+  `NON_COOKIE_QUERY` 里那几个**路由参数**（`gourl` / `c` / …）—— 那不是 cookie，
+  照收的话配置里会多一行看不懂的东西。
+- `merge_cookie(base, extra)`：罐的语义。`extra` 盖 `base`（**留在原位**），
+  `base` 里有、`extra` 里没有的照旧留着，新字段追加在后面。顺序稳 = `config.toml`
+  每次保存长得一样，git diff 里才看得出改了哪一条。
+- 落盘时传的 `base` 是 **client 手上那串**（`BiliClient::raw_cookie()`）：
+  这一趟响应没重发 `buvid3`，那份设备标识也不该被洗掉。
+- **判登录成功只看这一趟新拿到的**（`has_cookie(&extra, …)`，不看并完的罐）：
+  罐里那两份可能是上次留下的旧值，拿它去判断会把「什么都没拿到」当成登录成功。
+
+**发请求那半边本来就是整罐**：`Auth.header` 就是原串（`sanitize_cookie` 只掐控制字符，
+非 ASCII 才整条丢掉），所以「服务端给什么就带什么」不用改，但**别顺手在那儿加过滤** ——
+`api/client.rs` 的 `the_whole_jar_goes_out_on_every_request` 那条测试钉着它。
+
+**这一轮顺手量到的（详见「实测过」里那节）**：程序真会调的那些只读接口
+**一个都不返** `buvid3` / `buvid4` / `b_nut` —— 别指望整罐存能把它们捞回来。
+
+**别做的事**：不要为了「配置里干净」再把字段挑一遍；也不要自己去加一个
+「申请设备号」的接口 —— 要不要主动要一个 `buvid3` 由 tc191 定，那是另一步。
+
+### 19. 弹幕滚动（只认滚轮 + 鼠标捕获）
+
+**只有鼠标滚轮**，一个键盘键位都不占（`↑↓` 是发送历史、`Home`/`End` 是行首行尾、
+`PgUp`/`PgDn` 也一并留着）。回到底部的办法只有一个：**往下滚到底**。
+`no_keyboard_key_scrolls_the_danmaku` 那条测试就是拦「以后顺手加个键位」的。
+
+- 指针**落在弹幕框矩形里**才算（矩形由 `main_layout` 算，画图和热区共用一份，
+  两边各算一次的话热区迟早跟眼睛看到的框对不上），一格 3 行（`WHEEL_LINES`）。
+  配置页上滚轮**不许**动弹幕的视口。
+- **粘底 / 钉住**：默认粘底（新弹幕跟着走），上翻之后**钉住绝对行号** ——
+  不能存「离底部还差几行」，那样新弹幕进来会一行一行把内容推走，就不是钉住了。
+  滚回底部自动恢复粘底（`Viewport::follow`）。
+- **`MAX_LINES` 挤掉头部那行时，钉住的下标要跟着减一**：不减的话屏幕上的内容
+  会自己往下跳一行。
+- 右边界**内侧**一条进度：`█` 滑块、`│` 轨道（`thumb()` 算位置，单拆出来是为了
+  能直接断言顶 / 中 / 底三个位置）。内容不满一屏**不画**；框**窄到 3 格以下也不画** ——
+  一列宽的终端上那个 `area.right() - 2` 会下溢（debug 直接 panic），
+  `tiny_terminal_does_not_panic` 里那几个「窄而高」的尺寸把它钉住了。
+- 上翻时标题写「已上翻 N 行 · 滚到底恢复跟随」—— 不写这一句，用户对着一屏旧弹幕
+  只会以为程序卡住了。
+
+**鼠标捕获（`EnableMouseCapture` / `DisableMouseCapture`）**：
+
+- 开关是 `config.toml` 的 `mouse`（**默认开**）。**默认开的代价**：终端会把鼠标事件
+  交给程序，终端自己那套「按住拖拽选中文字 / 双击选中一个词」就不管用了 ——
+  想选中文、复制推流密钥得**按住 `Shift` 再拖**（多数终端留着这个后门）。
+  这条代价在 `config.rs` 的字段注释里也写了一份。
+- **退出和 panic 都必须还回去**：`restore()` 第一件事就是 `release_mouse()`，
+  panic 钩子装的也是同一个 `restore()`。留在捕获状态里，用户没法选中文、
+  终端自己的滚动也废了，只能重开一个终端。
+- 「还回去了没有」是个可查的状态（`MOUSE_CAPTURE` + `mouse_capture_enabled()`）：
+  真终端上的 escape 序列没法在单测里断言，但 `leaving_turns_the_mouse_capture_back_off`
+  能钉住这一步（`restore` 和 panic 钩子都走 `release_mouse` 这一个口子）。
+- 事件循环**一次把积压的事件收干净再重画**：crossterm 的 `EnableMouseCapture`
+  顺带把「鼠标移动」（1003）也打开了，一条一条处理、每处理一条重画一帧的话，
+  鼠标在窗口上划一下就能把 CPU 吃满。
+
 ## 测试
 
 `cargo test` 必须全绿，且**不许引入真实网络请求**（真接口只许手工验，见下）。
@@ -693,20 +772,33 @@ Hello(op 0) -> Identify(op 1) -> Identified(op 2) -> Request(op 6) -> Response(o
 - `api/client.rs`：`post_form` 的表单编码；脏 Cookie 不能把进程带走；
   `cookie_value` 取 `bili_jct`（缺键/空值/带换行）；换凭据（`set_cookie`）要换掉
   `Mutex<Auth>` 里的两样**并且**清掉 nav 缓存；**换成空串之后 `logged_in()` / `csrf()`
-  都得为假 / 为空**（退出登录走的就是这一个口子）
+  都得为假 / 为空**（退出登录走的就是这一个口子）；**整罐原样发出去**
+  （`buvid3` / `b_nut` 这些一个都不许被挑掉）
 - `api/send.rs`：`split_segments` 的边界（空串、正好 20、21、41 个中文、`limit=0` 不 panic）；
   假服务器上断言**路径 + WBI 参数（逐字节等于 `wbi::sign` 的结果）+ 七个表单字段 +
   cookie/浏览器头**；`code != 0` 带上服务端的 message；没有 `bili_jct` 时一个请求都不发；
   21 个字切两段且真有间隔；一段失败要变成系统弹幕
 - `ui/mod.rs`：用 `TestBackend` 把一帧画进内存再读回来，验弹幕上限、框标题的刷新时间与
-  「没刷上」、前三名奖牌、推流状态、超小终端不 panic；
+  「没刷上」、前三名奖牌、推流状态、超小终端不 panic（**窄而高**的那几组也要留着：
+  `(1,20)` / `(2,20)` 这种尺寸才走得到滚动条那段代码，原来的小尺寸高度都不够）；
   另外验输入框（按字符编辑 / 历史 10 条与翻到头翻到底 / Ctrl+C 和 Ctrl+R 不被当文字收 /
   空回车不发）、推流状态格的整段截断，以及**打字 -> 回车 -> 假服务器上真的出现
   `/msg/send` 请求**这条端到端的路
   （注意：缓冲区里宽字符会多占一格留下空格，断言前两边都 `flat()` 掉空白再比）
+- `ui/mod.rs`（弹幕滚动）：粘底时新弹幕跟着走 / 上翻之后**钉住**（来新弹幕视口不动）/
+  滚回底部恢复跟随 / 滚到顶停住 / 不满一屏没什么可滚且**不画滚动条**；
+  `thumb()` 的顶 / 中 / 底三个位置 + 溢出不超过界；滚动条真的画在右边界内侧那一格上
+  （从 `TestBackend` 缓冲区按坐标读，**不能**去数拼出来的字符串 —— 宽字符后面
+  那半格是空 symbol，会把格子数骗歪）；标题写出「已上翻 N 行」；
+  鼠标落点在弹幕框外 / 在配置页上都不动视口；**键盘键位一个都不许滚**
+  （`PgUp` / `PgDn` / `Home` / `End` / `Ctrl+Home` / `Ctrl+End` / `↑↓` 全试一遍）；
+  退出会把鼠标捕获还回去（`MOUSE_CAPTURE` 那个可查状态）
 - `api/login.rs`：`next_step` 四种 code 各一条（外加没见过的 code 不能硬猜成成功/过期）；
-  cookie 从 `Set-Cookie`（属性里的 `=`、`deleted`、旁路 cookie）和跳转 URL 的 query
-  （`%2C` 要解码、字段顺序乱、只有一部分）里抠得对不对；拼装的顺序固定不固定；
+  cookie 从 `Set-Cookie`（属性里的 `=`、`deleted`、**整罐都收**、同名只留先到的）
+  和跳转 URL 的 query（`%2C` 要解码、不认识的字段照收、`gourl` 这种路由参数要挡掉）
+  里抠得对不对；**罐的合并**（新的盖旧的且留在原位、这次没重发的 `buvid3` 要留着、
+  新字段追加在后面、空罐/空串不 panic）；端到端那条**带着 `Set-Cookie` 的设备号
+  走到交接出来的 Cookie 串里**（用 `test_http::start_with_headers`）；
   整条流程在假服务器上打一遍（generate → poll 三次不同 code → 成功），
   断言请求路径、`qrcode_key` 参数、轮询次数，以及最后交接出来的那串 Cookie
   （`LoginCtx` 的 `gap` / `attempts` 做成字段就是为了这里能传 0，别让单测真睡 2 秒）
@@ -848,6 +940,18 @@ Hello(op 0) -> Identify(op 1) -> Identified(op 2) -> Request(op 6) -> Response(o
 顺手把 `area_tree::AreaTree::new(areas, 保存的 area_id)` 的可见行打出来（`>` 标光标），
 好一眼看出「到底展开了谁」。同一个探针也给 `--smoke-area 371` 这样带一个 area_id 用。
 放法同上：在 `cli::Cli::parse` **之前**。
+
+**看响应头里有什么 cookie 的探针**（2026-10-03 用过，**不用改代码**）：
+只读接口 + `curl -D -` 就够，空 cookie 也不会碰账号上任何东西（`-o /dev/null`
+连 body 都不用要）。想知道「某个接口会不会给某个 cookie」时用它，
+比塞一个 `--smoke` 分支快得多（第九轮量设备号就是这么干的，结果见「实测过」）：
+
+```bash
+UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36'
+curl -s -D - -o /dev/null 'https://api.live.bilibili.com/room/v1/Room/get_info?room_id=6' \
+     -H "User-Agent: $UA" -H 'Accept: */*' \
+     -H 'Origin: https://live.bilibili.com' -H 'Referer: https://live.bilibili.com/' | grep -i set-cookie
+```
 
 **OBS 联动的探针**（2026-10-03 用过，跑完已删）：`--smoke-obs`（只跑 `obs::resolve`，
 纯读文件）和 `--smoke-obs-fill`（`resolve` + `fill`）。**用它必须先把
@@ -1041,7 +1145,83 @@ AI / 别人**不许**代为跑一遍真接口。他验的时候盯这三件事�
   同一个线程把自己锁死 —— 扫码登录**成功那一刻**进程会一声不响地卡住。
   现在收进 `signal_credential_change`（用 `send_modify`），退出登录那条测试把它钉住
 
+### 已完成（2026-10-03，第九轮：cookie 整罐 + 弹幕滚动）
+
+两件事，行为参照物都是 Go 版，但**没有抄代码**。
+
+- **cookie 整罐存**（见第 18 条）：`api/login.rs` 的 `cookies_from_set_cookie` /
+  `cookies_from_redirect` / `merge_cookie` 从「白名单挑五个字段」改成「服务端给什么
+  就存什么」；新增 `split_cookie`（拆罐，控制字符照旧掐掉）和 `has_cookie`（判登录成功
+  只看这一趟新拿到的）；删掉 `COOKIE_NAMES`，换成只挡路由参数的 `NON_COOKIE_QUERY`。
+  `api/client.rs` 新增 `raw_cookie()`（登录合并时当底，这一趟没重发的字段不丢）。
+  配置文件格式**没变**，还是 `cookie = "k=v; k=v"`。
+- **弹幕滚动**（见第 19 条）：`ui/mod.rs` 新增 `Viewport { top, follow }` +
+  `view_top` / `hidden_below` / `scroll_by` / `on_mouse`；`main_layout()` 把主页面
+  各块的矩形抽出来（画图和滚轮热区共用一份）；弹幕框右边界内侧画滚动条
+  （`thumb()` 算位置，`█` 滑块 / `│` 轨道，不满一屏不画）；上翻时标题写
+  「已上翻 N 行 · 滚到底恢复跟随」。
+- **鼠标捕获**：`setup(cfg.mouse)` 开 `EnableMouseCapture`，`restore()` 第一件事是
+  `release_mouse()`，并且装了 panic 钩子（走同一个 `restore`）—— 退出和 panic 都不会
+  把终端留在捕获状态。「还回去了没有」有可查的状态（`MOUSE_CAPTURE`）。
+  事件循环改成**一次把积压的事件收干净再重画**（鼠标移动事件是 1003 一起开的）。
+- `config.rs` 新增 `mouse`（默认 `true`），注释里写清楚默认开的代价（要选中文得
+  **按住 Shift 拖**）。
+- 15 个新测试（231 个全绿），`cargo build` / `cargo clippy --all-targets` 干净。
+- `api/test_http.rs` 新增 `start_with_headers`（原来那套 `(状态码, body)` 表达不出
+  `Set-Cookie`，而登录那条链的凭据正藏在响应头里）；`start` 收成它的一个薄壳，
+  几十处老调用一处都没动。
+- **真终端验过滚轮**（临时探针 + python pty，探针跑完已删）：滚三格 -> 标题变成
+  「已上翻 9 行」、屏幕上是 80 行里的第 50…70 行、右侧 `█` 滑块正好落在算出来的
+  那 5 格上；指针挪到左半边再滚、在配置页上滚，视口都不动；`Ctrl+C` 之后字节流里
+  能看到 `?1000l` / `?1006l`（鼠标还回去了）和 `?1049l`，退出码 0。
+- **顺手补掉一个自己写出来的 panic**：滚动条那个 `area.right() - 2` 在**一列宽**的
+  终端（高度够、弹幕又满一屏）上会下溢 —— debug 下直接整屏消失。现在框窄到 3 格
+  以下就不画，`tiny_terminal_does_not_panic` 多钉了 `(1,20) (2,20) (3,20) (4,20) (120,14)`
+  这几组「窄而高」的尺寸（原来那几组高度都不够，滚动条那段代码根本没走到）。
+- **顺带看到的（不是这一轮碰出来的）**：上面那次 pty 验证一开始拿真房间跑，
+  房间 6（短号 `6` 和规范号 `7734200` 都试了）**45 秒一条弹幕都没来、
+  也没有任何系统提示** —— 弹幕那条链路既不投递也不报错（`pump` 不等服务端那句
+  认证回话，`connect_ws` 本身也没有超时），所以只能临时塞一屏假弹幕来验滚轮。
+  `api/danmaku.rs` 这一轮**一行都没动**，但下一轮要验真弹幕前先知道这件事：
+  上面「实测过」那节里记着今天早些时候还收得到真弹幕（`op=8 {"code":0}` + 真报文），
+  而现在这个出口 IP 上 `getDanmuInfo` 不带签名是
+  `-352`（见「实测过」那节），ss 里能看到连接是 ESTABLISHED 的（本机走 `198.18.0.x`
+  那种代理网段）—— 多半是风控把内容扣住了，不是代码。
+
 ### 实测过（真接口）
+
+**cookie 里的设备号到底从哪来（2026-10-03，第九轮，全程只读：空 cookie + curl）**。
+这一轮把 cookie 改成整罐存取（见第 18 条），顺手拿几个只读接口看了响应头，
+想知道「整罐存能不能真拿到 `buvid3` / `buvid4` / `b_nut`」：
+
+```bash
+UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/96.0.4664.110 Safari/537.36'
+curl -s -D - -o /dev/null '<接口地址>' -H "User-Agent: $UA" -H 'Accept: */*' \
+     -H 'Origin: https://live.bilibili.com' -H 'Referer: https://live.bilibili.com/'
+```
+
+```text
+GET api.bilibili.com/x/web-interface/nav                        -> 200，**没有任何 Set-Cookie**
+GET api.live.bilibili.com/room/v1/Room/get_info?room_id=6       -> Set-Cookie: LIVE_BUVID=AUTO1790…（直播侧的设备号）
+GET api.live.bilibili.com/xlive/…/getDanmuInfo?id=6&type=0      -> 不带 WBI 签名时 code=-352，无 Set-Cookie
+GET passport.bilibili.com/x/passport-login/web/qrcode/generate  -> 200，**没有 Set-Cookie**
+GET api.bilibili.com/x/frontend/finger/spi                      -> body 里给 b_3 / b_4（就是 buvid3 / buvid4 那对）
+GET www.bilibili.com/                                           -> Set-Cookie: buvid3=BA59A1E3-…; Set-Cookie: b_nut=1790981010
+```
+
+结论（**「没有」也得记下来**，免得下一轮又指望整罐存能把它们捞回来）：
+
+1. **`buvid3` / `buvid4` / `b_nut` 三个，程序真会调的那些只读接口一个都不返。**
+   `buvid3` / `b_nut` 是 `www.bilibili.com` 那个页面发的；`buvid3` / `buvid4`
+   还能从 `x/frontend/finger/spi` **主动要**（body 里的 `b_3` / `b_4`）。
+2. 整罐存真正能拿到、以前会丢掉的，是 `Room/get_info` 那种响应头里的 `LIVE_BUVID`
+   （直播侧设备号）—— 但**这一轮的整罐只作用于扫码登录那一下**：房间信息是 30 秒
+   一轮的只读轮询，响应头谁也不存，所以它现在也落不了盘。
+3. ws 认证包里那个 `buvid` 字段（`danmaku.rs`）**跟 Go 版一样是空的**，
+   不是这一轮漏的（Go 版 `getter.go` 里那个 `Buvid` 也从来没赋过值）。
+4. **要不要主动去要一个设备号**（`x/frontend/finger/spi`，或者把浏览器里的
+   `buvid3` 抄进 `config.toml`）**由 tc191 定** —— 这一轮只把「整罐不再丢字段」
+   做完，没有加任何新的接口调用。
 
 nav、房间信息（在播/未播两种）、观众榜（3 人 / 50 人两种）、getDanmuInfo（没 -352）、
 wss 认证（`op=8 {"code":0}`）、**真实弹幕解析**（含 `[dog]` 这类表情标签）、
@@ -1350,7 +1530,28 @@ Shift+Tab      -> 账号栏：▸ 重新扫码 / 退出登录 都在，▸ 在�
      `login_loop` 在轮询中间也能被新信号打断（Go 版靠 `qrGen` 计数作废旧那一轮）。
    - 没有「退出登录之后再自动退出发送链路」：`send_loop` 每次现取 `csrf()`，
      没凭据时就往弹幕框里说「Cookie 里没有 bili_jct…」，行为是对的，不用管。
-3. 弹幕列表不能滚动/翻页，只能看最后几行。
+3. ~~弹幕列表不能滚动/翻页，只能看最后几行~~ —— 2026-10-03 第九轮接完了
+   （滚轮，见第 19 条）。留下的口子见下面 2.5。
+2.5 **第九轮（cookie 整罐 + 弹幕滚动）留下的口子**：
+   - **滚动只有滚轮，没有一个键盘键位**（这是 tc191 定的）：终端里没有鼠标、
+     或者鼠标事件被别的东西吃掉（比如 ssh 里没开会话的鼠标转发）时，就**看不了旧的弹幕**。
+     要补得先跟他确认键位（`PgUp`/`PgDn` 是最自然的候选，`no_keyboard_key_scrolls_the_danmaku`
+     那条测试会先红在哪儿，改的时候顺手一起改）。
+   - **设备号那件事只做了一半**：整罐存不再丢字段了，但我们调的只读接口**不返**
+     `buvid3` / `buvid4` / `b_nut`（见「实测过」里那节），所以「每次重启都是新设备」
+     这件事**还没真治**。三条路可选（都由 tc191 定，AI 别自己加）：
+     ① 他把自己浏览器里的 `buvid3` 抄进 `config.toml`（零代码，但要手工）；
+     ② 加一次 `x/frontend/finger/spi`（只读，拿到 `b_3` / `b_4` 并并进罐里）；
+     ③ 把**响应头里的 `Set-Cookie` 也并进客户端那罐**（`Room/get_info` 会给
+     `LIVE_BUVID`），但那要再想清楚「什么时候落盘」—— 现在只有扫码登录 / 选分区 /
+     退出登录会写配置，轮询响应头攒下来的东西没人写。
+   - **ws 认证包里的 `buvid` 还是空的**（跟 Go 版一致）。真要填，得先有上面那条 ②/③
+     拿到的设备号 —— 别凭空编一个。
+   - **`thumb()` 的滑块长度取的是「一屏行数 / 总行数」**，跟浏览器那种按像素比例算的
+     手感略有出入（一行内容的显示高度可能不止一行）。现在一条弹幕一行，够用。
+   - 滚轮**不能横向滚**（长弹幕不折行被截断，还是没救）；`single_line = false`
+     的多行模式下「一行」指的是排版后的那一行，视口按行算没错，但一屏能放几条弹幕
+     会随着内容长度变，上翻的手感跟单行模式不一样。
 4. 没有「弹幕关键词过滤」「屏蔽用户」这类开关。
 5. 主播侧数据（观众榜分数）拿到了但没显示在界面上，只显示了名字。
 6. 发送端没有前端节流：连按回车会排队发（频道容量 32，满了会在弹幕框里提示这条没发出去）。
@@ -1383,3 +1584,14 @@ Shift+Tab      -> 账号栏：▸ 重新扫码 / 退出登录 都在，▸ 在�
   （`~` / `*` 的口径相反，签名会对不上）
 - 不要在登录成功后去动弹幕那条**已经在跑的**连接 —— 换不掉，只能整条重来
 - 不要为了登录把 reqwest 的 `cookie_store` 打开：那跟我们自己管的 Cookie 头是两套账
+- **不要把 cookie 再挑成白名单**（第 18 条）：整罐是治「每次重启都是新设备」的那一步，
+  谁想「配置里干净点」顺手 filter 一下，等于把这个病请回来。要验证就加自己的浏览器
+  `buvid3`，别在代码里筛。也别为了这个自己在 `api/` 里加「申请设备号」的接口调用 ——
+  由 tc191 定（见「实测过」那节）。
+- **不要给弹幕滚动加键盘键位**：`↑↓` 是发送历史、`Home`/`End` 是行首行尾、
+  `PgUp`/`PgDn` 也一并留着（tc191 定的）。`no_keyboard_key_scrolls_the_danmaku`
+  那条测试就是拦这个的；要改先问人，别「顺手补一个」。
+- **开了鼠标捕获就必须还回去**：一律走 `set_mouse_capture` / `release_mouse`
+  （状态记账在那儿），`restore()` 和 panic 钩子都别再自己写一串 `execute!` ——
+  TUI panic 之后终端还在捕获状态里，用户连选文字都做不到。
+- 不要在临时探针里把 cookie 或响应头整串打印出来（要打印就只打印**字段名**）。

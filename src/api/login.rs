@@ -13,23 +13,27 @@ use anyhow::{Result, bail};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::sleep;
 
-use crate::api::client::{BiliClient, Nav, cookie_value, int_of, str_of};
+use crate::api::client::{BiliClient, Nav, int_of, str_of};
 
 pub const PASSPORT_BASE: &str = "https://passport.bilibili.com";
 
 const GENERATE_PATH: &str = "/x/passport-login/web/qrcode/generate";
 const POLL_PATH: &str = "/x/passport-login/web/qrcode/poll";
 
-/// 会被写进 config.toml 的字段，顺序也按它来。
+/// 跳转 URL 的 query 里那**几个不是 cookie** 的参数。
 ///
-/// 只留这五个：`buvid3` 之类的旁路 cookie 服务端每次都重发一份，
-/// 存下来既没用，又会让用户以为配置里那串是什么要紧的机密。
-pub const COOKIE_NAMES: [&str; 5] = [
-    "SESSDATA",
-    "bili_jct",
-    "DedeUserID",
-    "DedeUserID__ckMd5",
-    "sid",
+/// 兜底那条路拿到的是一个网址，不是服务端的 cookie 罐：里面除了凭据，还有 `gourl` / `c`
+/// 这类给人看的路由参数。照单全收的话配置里会多出 `gourl=https://live.bilibili.com`
+/// 这种行 —— 下次带着它发请求服务端不认，用户也看不懂那是什么。所以只挡掉已知的
+/// 路由参数，其余照收（B 站以后加的新 cookie 依旧自动跟上）。
+const NON_COOKIE_QUERY: [&str; 7] = [
+    "gourl",
+    "c",
+    "t",
+    "from",
+    "callback",
+    "navhide",
+    "qrcode_key",
 ];
 
 /// `data.code` 的取值。注意不是外壳那个 `code` —— 外壳恒为 0，
@@ -104,26 +108,32 @@ pub async fn poll(client: &BiliClient, base: &str, key: &str) -> Result<(QrPoll,
     ))
 }
 
-/// 从 `Set-Cookie` 里抠出要持久化的字段。
+/// 从 `Set-Cookie` 里抠出 cookie 本身：**整罐都收**，不再挑字段。
+///
+/// 老的白名单只留 SESSDATA / bili_jct / DedeUserID / DedeUserID__ckMd5 / sid 五个，
+/// 于是 `buvid3` 这类**设备标识**每次重启都丢 —— 服务端眼里我们每次都是陌生设备，
+/// 弹幕 / 房间信息那些接口的风控看的正是它们，表现就是时不时莫名其妙地断。
+/// 整罐收之后 B 站以后加什么新字段都自动跟上，不用再改代码。
 ///
 /// 一条长这样：`SESSDATA=xxx; Path=/; Domain=.bilibili.com; HttpOnly`。
-/// 只取第一个 `=` 之前那一段，后面的属性全不要 —— 把 `Path=/` 当成值存进配置，
-/// 下次带上去服务端只当你没登录。
+/// 只取第一个 `=` 到第一个 `;` 之间那一段，后面的属性全不要 —— 把 `Path=/` 当成值
+/// 存进配置，下次带上去服务端只当你没登录。
 ///
 /// 值是 `deleted` 的跳过：那是服务端在**清**这个 cookie（退出登录会用到），
 /// 照收下来配置里就多一串 `SESSDATA=deleted`，比没有还糟。
 pub fn cookies_from_set_cookie(headers: &[String]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
     for h in headers {
         let Some((name, rest)) = h.split_once('=') else {
             continue;
         };
         let name = name.trim();
-        if !COOKIE_NAMES.contains(&name) {
+        let value = rest.split(';').next().unwrap_or("").trim();
+        if name.is_empty() || value.is_empty() || value.eq_ignore_ascii_case("deleted") {
             continue;
         }
-        let value = rest.split(';').next().unwrap_or("").trim();
-        if value.is_empty() || value.eq_ignore_ascii_case("deleted") {
+        // 同名一条 cookie 一个值，先到的算数（浏览器也是这个口径）
+        if out.iter().any(|(n, _)| n == name) {
             continue;
         }
         out.push((name.to_string(), value.to_string()));
@@ -131,57 +141,84 @@ pub fn cookies_from_set_cookie(headers: &[String]) -> Vec<(String, String)> {
     out
 }
 
-/// 从成功跳转 URL 的 query 里抠同样那几个字段 —— 这是**兜底**那条路。
+/// 从成功跳转 URL 的 query 里抠凭据 —— 这是**兜底**那条路。
 ///
 /// `Set-Cookie` 有可能被中间那几跳吃掉（真遇到过），那样凭据就只剩 URL 上这一份。
 /// query 是百分号编码的，得解一次码：SESSDATA 里的逗号在 URL 上是 `%2C`，
 /// 不解码直接存进配置，下次带上去服务端认不出来，表现的却只是「登录态时好时坏」。
+///
+/// 这里只挡掉 `NON_COOKIE_QUERY` 里那几个路由参数，其余照收：跟 `Set-Cookie` 那条一样，
+/// 我们不认识的新字段不该被丢掉（B 站换一次名字就得改一次白名单，那是上一版的病）。
 pub fn cookies_from_redirect(url: &str) -> Vec<(String, String)> {
     let Some((_, rest)) = url.split_once('?') else {
         return Vec::new();
     };
     let query = rest.split('#').next().unwrap_or(rest);
     url::form_urlencoded::parse(query.as_bytes())
-        .filter(|(k, _)| COOKIE_NAMES.contains(&k.as_ref()))
+        .filter(|(k, _)| {
+            !k.is_empty() && !NON_COOKIE_QUERY.iter().any(|n| k.eq_ignore_ascii_case(n))
+        })
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .filter(|(_, v)| !v.is_empty())
+        .filter(|(_, v)| !v.is_empty() && !v.eq_ignore_ascii_case("deleted"))
         .collect()
 }
 
-/// 把新拿到的字段和原来那串拼成一份完整的 Cookie。
+/// 把新拿到的字段并进原来那串，拼回一份完整的 `k=v; k=v`。
 ///
-/// `extra` 里**前面的优先**（调用方按 Set-Cookie、跳转 URL 的顺序拼），
-/// 缺的再从 `base` 里补；输出顺序固定按 `COOKIE_NAMES` 走。
-/// 顺序固定是为了 config.toml 每次保存都长得一样 —— 一堆 cookie 每次换位置，
-/// git diff 里根本看不出到底改了哪一条。
+/// **罐的语义**：`extra` 里有什么就存什么（新的盖旧的），`base` 里有、`extra` 里没有的
+/// 照旧留着 —— 登录接口这一趟没重发 `buvid3`，那份设备标识也不能就此洗掉。
+/// 顺序也稳：旧的留在原位、新的追加在后面，config.toml 每次保存才长得一样
+/// （一堆 cookie 每次换位置，git diff 里根本看不出到底改了哪一条）。
+///
+/// 空串进空串出，不 panic。
 pub fn merge_cookie(base: &str, extra: &[(String, String)]) -> String {
-    let mut have: Vec<(&'static str, String)> = Vec::new();
-    for (k, v) in extra {
-        let Some(name) = COOKIE_NAMES.iter().find(|n| *n == k).copied() else {
-            continue;
-        };
-        if v.is_empty() || have.iter().any(|(n, _)| *n == name) {
+    let mut jar = split_cookie(base);
+    // 同一趟里同名出现两次时**前面的赢**：调用方按「Set-Cookie 在前、跳转 URL 在后」
+    // 拼，后者只是兜底，不该盖掉响应头里那份。
+    let mut taken: Vec<&str> = Vec::new();
+    for (name, value) in extra {
+        if name.trim().is_empty() || value.is_empty() || value.eq_ignore_ascii_case("deleted") {
             continue;
         }
-        have.push((name, v.clone()));
+        if taken.contains(&name.as_str()) {
+            continue;
+        }
+        taken.push(name.as_str());
+        match jar.iter_mut().find(|(n, _)| n == name) {
+            // 新的盖旧的，而且留在**原来的位置**上（顺序不跟着新值跑）
+            Some(slot) => slot.1 = value.clone(),
+            None => jar.push((name.clone(), value.clone())),
+        }
     }
-    for name in COOKIE_NAMES {
-        if have.iter().any(|(n, _)| *n == name) {
-            continue;
-        }
-        if let Some(v) = cookie_value(base, name) {
-            have.push((name, v));
-        }
-    }
-    COOKIE_NAMES
-        .iter()
-        .filter_map(|name| {
-            have.iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| format!("{name}={v}"))
-        })
+    jar.iter()
+        .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// 把一串 cookie 拆成（名字，值），顺序跟原来一样、名字不重复。
+///
+/// 控制字符先掐掉：用户从 DevTools 里抄下来常连换行一起复制进来，留着它写回配置，
+/// 下次启动读出来就是带 `\r` 的一行。
+fn split_cookie(raw: &str) -> Vec<(String, String)> {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let mut jar: Vec<(String, String)> = Vec::new();
+    for kv in cleaned.split(';') {
+        let Some((k, v)) = kv.split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        if k.is_empty() || v.is_empty() || jar.iter().any(|(n, _)| n == k) {
+            continue;
+        }
+        jar.push((k.to_string(), v.to_string()));
+    }
+    jar
+}
+
+/// 这一趟拿到的字段里有没有这一个。登录成不成只看它，不看并完的整罐（理由见上面那条注释）。
+fn has_cookie(jar: &[(String, String)], name: &str) -> bool {
+    jar.iter().any(|(k, _)| k == name)
 }
 
 /// 界面要看的那些事。网络这半边只往通道里塞这个，别的什么都不干。
@@ -312,13 +349,13 @@ async fn run_once(ctx: &LoginCtx, evt: &Sender<LoginEvent>) {
                     .into_iter()
                     .chain(cookies_from_redirect(&status.url))
                     .collect();
-                let cookie = merge_cookie("", &extra);
                 // SESSDATA 是身份、bili_jct 是防 CSRF 的令牌，缺一个都不算登录成功：
                 // 少了后者所有写操作都会被服务端用「csrf 校验失败」拒掉，
                 // 而用户以为自己已经登录了，只会在那儿反复试。
-                if cookie_value(&cookie, "SESSDATA").is_none()
-                    || cookie_value(&cookie, "bili_jct").is_none()
-                {
+                //
+                // 查的是**这一趟新拿到的**（`extra`），不是并完的那罐：罐里那两份可能是
+                // 上一次登录留下的旧值，拿它去判断只会把「这次什么都没拿到」当成登录成功。
+                if !has_cookie(&extra, "SESSDATA") || !has_cookie(&extra, "bili_jct") {
                     let _ = evt
                         .send(LoginEvent::Failed(
                             "扫码成功了，但没拿到完整凭据（SESSDATA / bili_jct 缺一个），回车再扫一次"
@@ -327,6 +364,8 @@ async fn run_once(ctx: &LoginCtx, evt: &Sender<LoginEvent>) {
                         .await;
                     return;
                 }
+                // 整罐：手上那串当底（这一趟没重发的字段不能丢），这次拿到的盖上去。
+                let cookie = merge_cookie(&ctx.client.raw_cookie().await, &extra);
                 // 交接给会话任务，后面的落盘 / 换凭据 / 重启链路都归它。
                 let _ = ctx.creds.send(cookie).await;
                 return;
@@ -387,15 +426,25 @@ mod tests {
         assert_eq!(next_step(86039), QrStep::Unknown(86039));
     }
 
+    /// 整罐存：`Set-Cookie` 里有什么就收什么，字段一个不少。
+    ///
+    /// 以前这里是个五字段白名单，于是 `buvid3` 这类**设备标识**每次重启都丢，
+    /// 服务端眼里我们每次都是陌生设备（弹幕 / 房间信息那些接口的风控看的正是它）。
+    /// 顺序照服务端给的来，值里带 `%` `+` `:` `/` `_` 这些怪字符也要原样留着。
     #[test]
-    fn set_cookie_keeps_only_the_five_fields() {
+    fn set_cookie_keeps_the_whole_jar() {
         // 真实形状：值后面跟着一堆属性，属性里的等号不能被当成值的一部分
         let headers = vec![
             "SESSDATA=abc%2Cdef; Path=/; Domain=.bilibili.com; Expires=Wed, 01 Jan 2027 00:00:00 GMT; HttpOnly; Secure"
                 .to_string(),
             "bili_jct=tok; Path=/".to_string(),
-            "buvid3=xxx; Path=/".to_string(), // 旁路 cookie，不存
+            "buvid3=E2C4D3-1A2B_9%2Bx:y; Path=/".to_string(), // 就是它以前丢的
+            "buvid4=0FC65C30-FBBC-4B42-6909-Yqsv1UjLXGlX0hAHB0x/RSQw70Sh53ahI0lAoQv9qMAGE1S/ZSBR2wx8nu4hlygm; Path=/"
+                .to_string(),
+            "b_nut=1790981010; Path=/; Expires=Sat, 02 Oct 2027 22:43:30 GMT".to_string(),
             "DedeUserID=7; Path=/".to_string(),
+            "LIVE_BUVID=AUTO4117909810051344; expires=Fri, 31-Dec-2038 23:59:59 GMT; path=/; domain=.bilibili.com"
+                .to_string(),
             "notacookie".to_string(), // 连等号都没有，不能崩
         ];
         assert_eq!(
@@ -403,9 +452,36 @@ mod tests {
             vec![
                 ("SESSDATA".to_string(), "abc%2Cdef".to_string()),
                 ("bili_jct".to_string(), "tok".to_string()),
+                ("buvid3".to_string(), "E2C4D3-1A2B_9%2Bx:y".to_string()),
+                (
+                    "buvid4".to_string(),
+                    "0FC65C30-FBBC-4B42-6909-Yqsv1UjLXGlX0hAHB0x/RSQw70Sh53ahI0lAoQv9qMAGE1S/ZSBR2wx8nu4hlygm"
+                        .to_string()
+                ),
+                ("b_nut".to_string(), "1790981010".to_string()),
                 ("DedeUserID".to_string(), "7".to_string()),
+                ("LIVE_BUVID".to_string(), "AUTO4117909810051344".to_string()),
             ]
         );
+    }
+
+    /// 空罐子：任何入口都不许 panic（配置里 cookie 是空串是常态）。
+    #[test]
+    fn empty_jars_never_panic() {
+        assert!(cookies_from_set_cookie(&[]).is_empty());
+        assert!(
+            cookies_from_set_cookie(&[
+                String::new(),
+                "=v".to_string(),   // 没有名字
+                "k=".to_string(),   // 没有值
+                "k=v".to_string(),  // 就这一条能被收下
+                "k=other".to_string(), // 同名的第二条不要
+            ])
+            .eq(&[("k".to_string(), "v".to_string())])
+        );
+        assert_eq!(merge_cookie("", &[]), "");
+        assert_eq!(merge_cookie("  ;; = ;  ", &[]), "", "空罐子出来的还是空串");
+        assert_eq!(split_cookie(""), Vec::new());
     }
 
     /// 服务端用 `deleted` 表示「把这个 cookie 清掉」（退出登录会发）。
@@ -425,42 +501,53 @@ mod tests {
         // 兜底那条路：Set-Cookie 被跳转吃掉时，凭据只剩 URL 上这一份。
         // `%2C` 是 SESSDATA 里的逗号 —— 不解码就存，下次带上去服务端不认。
         let url = "https://passport.biligame.com/crossDomain?DedeUserID=7&bili_jct=tok%2C1&c=b\
-                   &SESSDATA=abc%2Cdef&gourl=https%3A%2F%2Flive.bilibili.com#frag";
+                   &SESSDATA=abc%2Cdef&buvid3=E2C4D3-1A2B_9%2Bx%3Ay\
+                   &gourl=https%3A%2F%2Flive.bilibili.com#frag";
         assert_eq!(
             cookies_from_redirect(url),
             vec![
                 ("DedeUserID".to_string(), "7".to_string()),
                 ("bili_jct".to_string(), "tok,1".to_string()),
                 ("SESSDATA".to_string(), "abc,def".to_string()),
+                // 不认识的字段照样收（以前这里按白名单全丢掉了）
+                ("buvid3".to_string(), "E2C4D3-1A2B_9+x:y".to_string()),
             ]
         );
+        // `gourl` 是路由参数、不是 cookie：照收的话配置里会多一行看不懂的
+        assert!(!merge_cookie("", &cookies_from_redirect(url)).contains("gourl"));
         // 没有 query / 不是 URL 的一律给空表，不能 panic
         assert!(cookies_from_redirect("").is_empty());
         assert!(cookies_from_redirect("https://live.bilibili.com/").is_empty());
     }
 
-    /// 输入的字段顺序乱、只有一部分，输出都要按固定顺序、缺的从原来那串补。
+    /// 合并是「罐」的语义：新的盖旧的（而且留在原位）、原来有、这次没重发的照旧留着、
+    /// 新字段追加在后面。顺序稳是为了 config.toml 每次保存长得一样。
     #[test]
-    fn merge_is_ordered_and_fills_the_gaps() {
+    fn merge_keeps_the_whole_jar_across_logins() {
+        let base = "SESSDATA=old; bili_jct=keepme; buvid3=device-7; DedeUserID=7";
         let extra = vec![
-            ("sid".to_string(), "s1".to_string()),
             ("SESSDATA".to_string(), "new".to_string()),
+            ("b_nut".to_string(), "1790981010".to_string()),
         ];
-        let merged = merge_cookie("SESSDATA=old; bili_jct=keepme; DedeUserID=7", &extra);
         assert_eq!(
-            merged, "SESSDATA=new; bili_jct=keepme; DedeUserID=7; sid=s1",
-            "顺序要固定，而且新的盖旧的"
+            merge_cookie(base, &extra),
+            "SESSDATA=new; bili_jct=keepme; buvid3=device-7; DedeUserID=7; b_nut=1790981010",
+            "盖掉的留在原位，这次没重发的 buvid3 留着，新字段追加在最后"
         );
 
-        // 两边都有同一个字段时，前面的（Set-Cookie）赢
+        // 两边都有同一个字段时，新拿到的赢
         let extra = vec![
             ("SESSDATA".to_string(), "from-header".to_string()),
             ("SESSDATA".to_string(), "from-url".to_string()),
         ];
         assert_eq!(merge_cookie("", &extra), "SESSDATA=from-header");
 
-        // 库里没有的字段（buvid3…）不该被带出来
-        assert_eq!(merge_cookie("buvid3=x; SESSDATA=a", &[]), "SESSDATA=a");
+        // 服务端的 `deleted` 不进罐：那是「把这个清掉」的意思，存下来比没有还糟
+        assert_eq!(merge_cookie("", &[("SESSDATA".to_string(), "deleted".to_string())]), "");
+        // 空值也不是 cookie
+        assert_eq!(merge_cookie("", &[("k".to_string(), String::new())]), "");
+        // 罐里原来那些，一个都不许丢
+        assert_eq!(merge_cookie("buvid3=x; SESSDATA=a", &[]), "buvid3=x; SESSDATA=a");
     }
 
     /// 整条流程：generate -> poll 三次（未扫 / 待确认 / 成功）-> 凭据交出去。
@@ -508,12 +595,12 @@ mod tests {
         let task = tokio::spawn(login_loop(ctx, start_rx, evt_tx));
         start_tx.send(()).await.unwrap();
 
-        // 交接出来的就是那五个字段拼成的 Cookie 串，顺序固定、值已解码
+        // 交接出来的是这一趟拿到的那些字段拼成的 Cookie 串，顺序照 URL 上给的来、值已解码
         let cookie = tokio::time::timeout(Duration::from_secs(5), creds_rx.recv())
             .await
             .expect("整条流程 5 秒内该走完")
             .expect("该交出凭据");
-        assert_eq!(cookie, "SESSDATA=abc,def; bili_jct=tok,1; DedeUserID=7; sid=s1");
+        assert_eq!(cookie, "DedeUserID=7; bili_jct=tok,1; SESSDATA=abc,def; sid=s1");
 
         let mut seen = Vec::new();
         while let Ok(ev) = evt_rx.try_recv() {
@@ -552,6 +639,69 @@ mod tests {
             assert_eq!(h.method, "GET");
         }
 
+        task.abort();
+    }
+
+    /// 端到端那一趟：`Set-Cookie` 里的**设备标识**真的能落到交出去的 Cookie 串里。
+    ///
+    /// 这是本轮要治的那个病：以前白名单只留五个字段，`buvid3` 走到这儿就被丢掉了。
+    /// 顺带钉住另一半 —— 手上原来就有的字段（这一趟服务端没重发的）也不许丢。
+    #[tokio::test]
+    async fn a_successful_scan_keeps_the_device_ids_from_set_cookie() {
+        let srv = test_http::start_with_headers(|r| {
+            if r.path.ends_with("/qrcode/generate") {
+                return (
+                    200,
+                    r#"{"code":0,"message":"0","data":{"url":"https://x/y","qrcode_key":"k"}}"#
+                        .to_string(),
+                    Vec::new(),
+                );
+            }
+            (
+                200,
+                r#"{"code":0,"message":"0","data":{"code":0,"message":"","url":""}}"#.to_string(),
+                vec![
+                    // 真实形状：值后面跟着一堆属性
+                    "set-cookie: SESSDATA=abc%2Cdef; Path=/; Domain=.bilibili.com; HttpOnly"
+                        .to_string(),
+                    "set-cookie: bili_jct=tok; Path=/".to_string(),
+                    "set-cookie: buvid3=E2C4D3-1A2B_9%2Bx:y; Path=/".to_string(),
+                    "set-cookie: b_nut=1790981010; Path=/".to_string(),
+                ],
+            )
+        })
+        .await;
+
+        // 配置里那串先带着一份设备标识：这趟响应里没有它，也不能就此被洗掉。
+        let client = Arc::new(BiliClient::new("buvid4=old-device").unwrap());
+        let (creds_tx, mut creds_rx) = tokio::sync::mpsc::channel(1);
+        let ctx = LoginCtx {
+            client,
+            base: srv.base.clone(),
+            gap: Duration::ZERO,
+            attempts: 3,
+            creds: creds_tx,
+        };
+        let (start_tx, start_rx) = tokio::sync::mpsc::channel(1);
+        let (evt_tx, _evt_rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(login_loop(ctx, start_rx, evt_tx));
+        start_tx.send(()).await.unwrap();
+
+        let cookie = tokio::time::timeout(Duration::from_secs(5), creds_rx.recv())
+            .await
+            .expect("整条流程 5 秒内该走完")
+            .expect("该交出凭据");
+        for want in [
+            // Set-Cookie 里的值是**原样**的（响应头不是 URL，不解码）；
+            // 跳转 URL 那条兜底才需要解百分号编码。
+            "SESSDATA=abc%2Cdef",
+            "bili_jct=tok",
+            "buvid3=E2C4D3-1A2B_9%2Bx:y",
+            "b_nut=1790981010",
+            "buvid4=old-device",
+        ] {
+            assert!(cookie.contains(want), "少了 {want}：{cookie}");
+        }
         task.abort();
     }
 

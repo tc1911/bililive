@@ -54,6 +54,21 @@ pub async fn start<F>(responder: F) -> FakeServer
 where
     F: Fn(&Request) -> (u16, String) + Send + Sync + 'static,
 {
+    start_with_headers(move |r| {
+        let (status, body) = responder(r);
+        (status, body, Vec::new())
+    })
+    .await
+}
+
+/// 跟 `start` 一样，但能额外给几个响应头（形如 `"set-cookie: a=b; Path=/"`）。
+///
+/// 单开一个入口只因为登录那条链的凭据就藏在 `Set-Cookie` 里 —— `(status, body)`
+/// 表达不出来，而给所有测试换签名会把几十处调用一起搅动。
+pub async fn start_with_headers<F>(responder: F) -> FakeServer
+where
+    F: Fn(&Request) -> (u16, String, Vec<String>) + Send + Sync + 'static,
+{
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("绑不上本地端口");
     let addr = listener.local_addr().unwrap();
     let hits = Arc::new(Mutex::new(Vec::new()));
@@ -68,11 +83,12 @@ where
                 let Some(req) = read_request(&mut sock).await else {
                     return;
                 };
-                let (status, body) = responder(&req);
+                let (status, body, extra) = responder(&req);
                 sink.lock().unwrap().push(req);
+                let extra: String = extra.iter().map(|h| format!("{h}\r\n")).collect();
                 let head = format!(
                     "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n",
+                     content-length: {}\r\nconnection: close\r\n{extra}\r\n",
                     body.len()
                 );
                 let _ = sock.write_all(head.as_bytes()).await;
