@@ -131,8 +131,14 @@ pub fn auth_packet(uid: i64, room_id: i64, token: &str) -> Vec<u8> {
 
 // ---------------------------------------------------------------- 消息
 
-/// 系统消息的 `kind`。界面靠它把提示和真弹幕分开着色。
-pub const SYSTEM_KIND: &str = "SYSTEM";
+/// 程序自己塞进弹幕框的消息用的 `kind`（**不是** B 站协议里的 `cmd`）。
+///
+/// 界面靠它把本地提示和真弹幕分开着色，而屏蔽配置永远绕过它
+/// （见 `config::Block::blocks`）：屏幕上「弹幕服务器已断开，正在重连」「未登录：…」
+/// 「还没设置直播间号」这些话就是靠它区分的。本地提示**绝不能**借用协议里的名字
+/// （`system` / `NOTICE_MSG` 那种）：默认屏蔽列表里的 `NOTICE_MSG` 正是拿来挡房间广播
+/// 刷屏的，借用它的本地提示会被一起吃掉，用户看到的是「程序坏了」。
+pub const LOCAL_KIND: &str = "LOCAL";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DanmuMsg {
@@ -144,17 +150,21 @@ pub struct DanmuMsg {
 }
 
 impl DanmuMsg {
-    pub fn system(text: impl Into<String>) -> Self {
+    /// 程序自己的一句话（断线 / 未登录 / 没配房间号 / 发不出去…）。
+    ///
+    /// 作者名仍显示成 `system`（用户看惯了这个前缀），但 `kind` 是 `LOCAL` —— 两者
+    /// 一个管显示、一个管「谁产生的」，别再合回去。
+    pub fn local(text: impl Into<String>) -> Self {
         Self {
             author: "system".to_string(),
             content: text.into(),
-            kind: SYSTEM_KIND.to_string(),
+            kind: LOCAL_KIND.to_string(),
             time: SystemTime::now(),
         }
     }
 
-    pub fn is_system(&self) -> bool {
-        self.kind == SYSTEM_KIND
+    pub fn is_local(&self) -> bool {
+        self.kind == LOCAL_KIND
     }
 }
 
@@ -394,7 +404,7 @@ pub async fn supervisor(room_id: i64, client: Arc<BiliClient>, tx: Sender<DanmuM
                     backoff = BASE_BACKOFF;
                 }
                 let msg = format!("弹幕连接断开（{} 秒后重连）: {e:#}", backoff.as_secs());
-                if tx.send(DanmuMsg::system(msg)).await.is_err() {
+                if tx.send(DanmuMsg::local(msg)).await.is_err() {
                     return;
                 }
             }

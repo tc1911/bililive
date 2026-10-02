@@ -149,7 +149,7 @@ async fn pump(
         for (i, seg) in segments.iter().enumerate() {
             // 一段失败不影响后面的段：Go 版也是发完剩下的再报。
             if let Err(e) = send_danmaku(&client, &base, room_id, seg).await
-                && tx.send(DanmuMsg::system(e.to_string())).await.is_err()
+                && tx.send(DanmuMsg::local(e.to_string())).await.is_err()
             {
                 return; // 界面没了
             }
@@ -324,9 +324,9 @@ mod tests {
     }
 
     /// 一段失败（被禁言、发送过于频繁）不能 panic、不能吞掉后面的段，
-    /// 只能变成一条系统弹幕挂到弹幕框里。
+    /// 只能变成一条本地提示挂到弹幕框里。
     #[tokio::test]
-    async fn a_failed_segment_becomes_a_system_danmaku() {
+    async fn a_failed_segment_becomes_a_local_danmaku() {
         let srv = test_http::start(|r| {
             if r.path.ends_with("web-interface/nav") {
                 return (200, nav_body());
@@ -348,8 +348,8 @@ mod tests {
         });
 
         tx.send("在".to_string()).await.unwrap();
-        let m = danmu_rx.recv().await.expect("失败必须变成一条系统弹幕");
-        assert!(m.is_system());
+        let m = danmu_rx.recv().await.expect("失败必须变成一条本地提示");
+        assert!(m.is_local());
         assert!(m.content.contains("发送过于频繁"), "{}", m.content);
         assert!(srv.hits().iter().any(|h| h.path == SEND_PATH), "请求该发出去过");
 

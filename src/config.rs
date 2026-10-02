@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::api::danmaku::LOCAL_KIND;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -36,6 +38,8 @@ pub struct Config {
     /// 「按住拖拽选中文字 / 双击选中一个词」就不管用了 —— 想选中文、复制推流密钥，
     /// 得**按住 Shift 再拖**（多数终端都留着这个后门）。受不了就在这儿写 false。
     pub mouse: bool,
+    /// 弹幕屏蔽（只影响本地看到什么，见 `Block`）
+    pub block: Block,
 }
 
 fn default_true() -> bool {
@@ -56,7 +60,66 @@ impl Default for Config {
             single_line: true,
             show_time: true,
             mouse: true,
+            block: Block::default(),
         }
+    }
+}
+
+/// 弹幕屏蔽：命中就不往弹幕框里放。
+///
+/// **只管本地看到什么**：B 站账号侧那套「屏蔽设置」是另一个接口，这里一个字都不动 ——
+/// 被挡掉的消息服务端照发、房间里的人照看见，只是我们这边不画。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Block {
+    /// 按消息类型（弹幕协议里的 `cmd`）屏蔽，**完全相等**才算命中。
+    ///
+    /// 默认挡两种**房间广播**：`NOTICE_MSG`（「<%持续充能%>投喂<%某某%>1个沧月神玺，
+    /// 快来围观」那种全房间滚动广播）和 `COMBO_SEND`（连击送礼，同一个人送礼刷出来的一串）。
+    /// 这俩一刷起来能把弹幕框铺满，自己发的聊天被**埋掉**——就是它们的锅。
+    /// 真有人送礼的 `SEND_GIFT`、以及所有聊天一律留着，那才是直播间的内容。
+    pub types: Vec<String>,
+    /// 按关键词屏蔽：内容里**包含**就算命中，不区分大小写；配置里前后的空格会被忽略。
+    pub keywords: Vec<String>,
+    /// 按用户名屏蔽：**完全相等**才算命中（只同几个字不算）。
+    pub users: Vec<String>,
+}
+
+impl Default for Block {
+    fn default() -> Self {
+        Self {
+            types: vec!["NOTICE_MSG".to_string(), "COMBO_SEND".to_string()],
+            keywords: Vec::new(),
+            users: Vec::new(),
+        }
+    }
+}
+
+impl Block {
+    /// 这条消息该不该被挡掉。`kind` 是协议里的 `cmd`（`DANMU_MSG` / `SEND_GIFT`…）。
+    ///
+    /// 只吃三个 `&str`、不碰 `DanmuMsg`：纯函数，好直接断言。
+    pub fn blocks(&self, kind: &str, author: &str, content: &str) -> bool {
+        // 程序自己塞进弹幕框的那句话（断线重连 / 未登录 / 没配房间号）永远放行，
+        // **用户在配置里写 `LOCAL` 也拦不住它**：屏幕上能告诉用户「出什么事了」的
+        // 就这几句话，把它们一起屏蔽掉，现象是「程序坏了」，而没人会想到是过滤在干活。
+        if kind == LOCAL_KIND {
+            return false;
+        }
+        if self.types.iter().any(|t| t.trim() == kind) {
+            return true;
+        }
+        // 空的（或只有空格的）关键词当没写：留着的话它会**匹配所有内容**，
+        // 一条手滑的空串就等于把弹幕框清空，还得让人找半天原因。
+        if self.keywords.iter().any(|k| {
+            let k = k.trim();
+            !k.is_empty() && content.to_lowercase().contains(&k.to_lowercase())
+        }) {
+            return true;
+        }
+        // 用户名**不 trim**：昵称里真可能有空格（或者前后正好有几个），
+        // 掐掉就变成「照抄下来还是配不上」。
+        self.users.iter().any(|u| u == author)
     }
 }
 
@@ -220,6 +283,11 @@ mod tests {
             single_line: false,
             show_time: false,
             mouse: false,
+            block: Block {
+                types: vec!["NOTICE_MSG".into(), "DANMU_MSG".into()],
+                keywords: vec!["抽奖".into()],
+                users: vec!["某人".into()],
+            },
         };
         cfg.save_to(&path).unwrap();
 
@@ -259,6 +327,13 @@ mod tests {
         assert!(!back.single_line);
         assert!(!back.show_time);
         assert!(!back.mouse, "滚轮开关也是「别的字段」，不许被顺手改掉");
+        assert_eq!(
+            back.block.types,
+            vec!["NOTICE_MSG", "DANMU_MSG"],
+            "屏蔽配置也是「别的字段」"
+        );
+        assert_eq!(back.block.keywords, vec!["抽奖"]);
+        assert_eq!(back.block.users, vec!["某人"]);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -288,5 +363,131 @@ mod tests {
         assert_eq!(back.room_id, 6, "清 cookie 之前必须重读一遍文件");
         assert_eq!(back.area_id, 235);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 老配置文件里根本没有 `[block]` 这一段，也得照样跑起来，而且拿到的是那三个默认值：
+    /// 挡房间广播（`NOTICE_MSG`）+ 连击送礼（`COMBO_SEND`），聊天和真送礼一律照留。
+    #[test]
+    fn an_old_config_without_the_block_section_gets_the_defaults() {
+        let raw = "room_id = 6\nsingle_line = true\nmouse = true\n";
+        let cfg: Config = toml::from_str(raw).expect("老配置必须能解析");
+        assert_eq!(cfg.block.types, vec!["NOTICE_MSG", "COMBO_SEND"]);
+        assert!(cfg.block.keywords.is_empty());
+        assert!(cfg.block.users.is_empty());
+    }
+
+    /// 写了 `[block]` 但只写了其中一两项：没写的那些还按默认来
+    /// （不能因为写了 `keywords` 就把默认要挡的广播放回来）。
+    #[test]
+    fn a_partial_block_section_keeps_the_other_defaults() {
+        let cfg: Config = toml::from_str("[block]\nkeywords = [\"抽奖\"]\n").unwrap();
+        assert_eq!(
+            cfg.block.types,
+            vec!["NOTICE_MSG", "COMBO_SEND"],
+            "没写的字段还按默认"
+        );
+        assert_eq!(cfg.block.keywords, vec!["抽奖"]);
+        assert!(cfg.block.users.is_empty());
+    }
+
+    /// 配置写坏了（比如把类型写成数字）要说人话别崩：报的那句话里得有
+    /// 「解析失败 + 哪个文件」，用户才知道去改哪儿。
+    #[test]
+    fn a_broken_block_is_a_plain_error_not_a_panic() {
+        let path = temp_path("broken-block");
+        std::fs::write(&path, "[block]\ntypes = 1\n").unwrap();
+        let err = Config::load_or_create(Some(&path))
+            .expect_err("写成数字该是一句错误")
+            .to_string();
+        assert!(err.contains("配置解析失败"), "{err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 三条规则各来一发：类型**完全相等**、关键词**包含**、用户名**完全相等**。
+    #[test]
+    fn block_matches_types_keywords_and_users() {
+        let b = Block {
+            types: vec!["NOTICE_MSG".into()],
+            keywords: vec!["抽奖".into()],
+            users: vec!["小明".into()],
+        };
+        assert!(b.blocks("NOTICE_MSG", "随便谁", "随便什么话"));
+        assert!(!b.blocks("DANMU_MSG", "随便谁", "随便什么话"), "聊天不在列表里");
+        assert!(b.blocks("DANMU_MSG", "小红", "快来抽奖啊"));
+        assert!(b.blocks("DANMU_MSG", "小明", "他说什么都挡"));
+    }
+
+    /// 类型只认完全相等，而且**不忽略大小写** —— cmd 是协议里定死的大写。
+    #[test]
+    fn block_type_is_exact() {
+        let b = Block {
+            types: vec!["NOTICE_MSG".into()],
+            ..Block::default()
+        };
+        assert!(!b.blocks("NOTICE_MSGG", "", ""), "多一个字母不算");
+        assert!(!b.blocks("notice_msg", "", ""), "类型不忽略大小写");
+    }
+
+    /// 关键词：内容里包含就算命中、**不区分大小写**、配置里前后的空格不算数。
+    #[test]
+    fn block_keyword_contains_ignores_case_and_surrounding_spaces() {
+        let b = Block {
+            keywords: vec!["  HeLLo ".into()],
+            ..Block::default()
+        };
+        assert!(b.blocks("DANMU_MSG", "", "hello world"));
+        assert!(b.blocks("DANMU_MSG", "", "有人 HELLO 你"));
+        assert!(b.blocks("DANMU_MSG", "", "hello"));
+        assert!(!b.blocks("DANMU_MSG", "", "helo"), "不是包含关系就别挡");
+    }
+
+    /// 用户名只认**完全相等**：多一个字、少一个字都不算命中。
+    #[test]
+    fn block_user_is_exact_and_a_partial_name_does_not_hit() {
+        let b = Block {
+            users: vec!["小明".into()],
+            ..Block::default()
+        };
+        assert!(b.blocks("DANMU_MSG", "小明", ""));
+        assert!(!b.blocks("DANMU_MSG", "小明明", ""), "多一个字不算");
+        assert!(!b.blocks("DANMU_MSG", "明", ""), "少一个字不算");
+    }
+
+    /// 三个列表全空就是「什么都别挡」（用户把默认那两条删掉时配出来的样子）。
+    #[test]
+    fn an_empty_block_lets_everything_through() {
+        let b = Block {
+            types: Vec::new(),
+            keywords: Vec::new(),
+            users: Vec::new(),
+        };
+        assert!(!b.blocks("NOTICE_MSG", "system", "快来围观"));
+        assert!(!b.blocks("DANMU_MSG", "小明", "随便说点什么"));
+    }
+
+    /// 空的（或只有空格的）关键词当没写：留着的话它会**匹配所有内容** ——
+    /// 一条手滑的空串等于把弹幕框清空，还得让人找半天原因。
+    #[test]
+    fn an_empty_keyword_matches_nothing() {
+        let b = Block {
+            keywords: vec!["".into(), "   ".into()],
+            ..Block::default()
+        };
+        assert!(!b.blocks("DANMU_MSG", "小明", "随便什么"));
+    }
+
+    /// 程序自己那几句话**永远不受屏蔽配置影响** —— 连把 `LOCAL` 写进 `types` 也拦不住它。
+    /// 默认那两条本来就是拿来挡房间广播的，早期本地提示若借用 `system` / `NOTICE_MSG`
+    /// 这类协议里的名字，一过滤就会连「弹幕服务器已断开，正在重连」一起吃掉，
+    /// 用户只会以为程序坏了。
+    #[test]
+    fn block_never_hides_our_own_messages() {
+        let b = Block {
+            types: vec!["LOCAL".into(), "NOTICE_MSG".into(), "SYSTEM".into()],
+            keywords: vec!["断开".into()],
+            users: vec!["system".into()],
+        };
+        assert!(!b.blocks(LOCAL_KIND, "system", "弹幕服务器已断开，正在重连"));
     }
 }

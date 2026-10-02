@@ -193,6 +193,9 @@ struct App {
     control: Control,
     /// 弹幕区看到哪儿了（粘底 / 上翻钉住）。
     view: Viewport,
+    /// 这次运行被屏蔽了多少条（只记数、不落盘：它是「这次挡掉了几条」，
+    /// 不是账号上的历史账，重启就该归零）。
+    blocked: usize,
 }
 
 /// 弹幕视口。
@@ -344,6 +347,20 @@ impl Input {
 }
 
 impl App {
+    /// 弹幕进列表的**唯一**入口：屏蔽就在这儿判，命中只记数、不落盘。
+    ///
+    /// 位置选在「进列表之前」而不是解析那一步：B 站进房间时会先推一批**历史弹幕**
+    /// （`danmaku::fetch_history`），它跟之后实时来的走的是同一条 channel ——
+    /// 从这儿过一遍，历史和新弹幕才**一视同仁**，不然现象会是
+    /// 「刚进房间还是满屏广播，过一会儿才干净」，用户会以为屏蔽没生效。
+    fn feed_danmu(&mut self, m: &DanmuMsg, cfg: &Config) {
+        if cfg.block.blocks(&m.kind, &m.author, &m.content) {
+            self.blocked += 1;
+            return;
+        }
+        self.push_danmu(m, cfg);
+    }
+
     fn push_danmu(&mut self, m: &DanmuMsg, cfg: &Config) {
         let stamp = if cfg.show_time {
             timefmt::hhmm(m.time)
@@ -351,7 +368,7 @@ impl App {
             String::new()
         };
 
-        if m.is_system() {
+        if m.is_local() {
             self.lines.push_back(Line::from(vec![
                 Span::styled(format!("[{stamp}] "), Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -516,7 +533,7 @@ async fn event_loop(
     loop {
         // 先收网络那边的消息再画，画面永远是最新的。
         while let Ok(m) = danmu_rx.try_recv() {
-            app.push_danmu(&m, &cfg);
+            app.feed_danmu(&m, &cfg);
         }
         while let Ok(r) = room_rx.try_recv() {
             // 顺手把标题喂给配置页的「直播间信息」栏，省得那一栏空着让人以为坏了 ——
@@ -656,8 +673,10 @@ async fn event_loop(
                                     {
                                         // 队列满、或者发送端没起来（比如没配房间号）。界面永远不等
                                         // 发送端，但这条得说清楚没发出去，不然用户对着空气等回显。
-                                        app.push_danmu(
-                                            &DanmuMsg::system(format!("这条没发出去（发送端没起来）：{text}")),
+                                        // 也走 `feed_danmu`：本地消息的类型是 `LOCAL`，
+                                        // 屏蔽配置一概拦不住它（见 `config::Block::blocks`）。
+                                        app.feed_danmu(
+                                            &DanmuMsg::local(format!("这条没发出去（发送端没起来）：{text}")),
                                             &cfg,
                                         );
                                     }
@@ -825,11 +844,17 @@ fn danmaku_panel(f: &mut Frame, app: &App, area: Rect) {
     // 上翻时必须说一声：不然用户对着一屏旧弹幕，以为程序卡住了。
     // 回到底部的办法只有一个（往下滚到底），这句话就把它一起说了。
     let hidden = app.hidden_below(rows);
-    let title = if hidden > 0 {
-        format!(" 弹幕们 · 已上翻 {hidden} 行 · 滚到底恢复跟随 ")
+    let mut title = if hidden > 0 {
+        format!(" 弹幕们 · 已上翻 {hidden} 行 · 滚到底恢复跟随")
     } else {
-        " 弹幕们 ".to_string()
+        " 弹幕们".to_string()
     };
+    // 屏蔽过的条数也得让人看见：一条广播都不显示时，用户分不清「屏蔽在干活」和
+    // 「B 站根本没发 / 程序收不到」。计数是本次运行累计，不落盘。
+    if app.blocked > 0 {
+        title.push_str(&format!(" · 已屏蔽 {} 条", app.blocked));
+    }
+    title.push(' ');
 
     f.render_widget(
         Paragraph::new(visible).block(Block::bordered().title(title)),
@@ -974,6 +999,8 @@ mod tests {
     use crate::api::room::OnlineRankUser;
     use ratatui::backend::TestBackend;
     use std::time::SystemTime;
+
+    use crate::api::danmaku::parse_message;
 
     /// 把一帧画进内存里的终端再读回来 —— 不用真终端也能验「界面上到底有没有那行字」。
     fn render(app: &App, cfg: &Config, width: u16, height: u16) -> String {
@@ -1282,6 +1309,130 @@ mod tests {
         assert!(mouse_capture_enabled(), "开了就该记着");
         release_mouse().unwrap();
         assert!(!mouse_capture_enabled(), "退出时没把鼠标还回去");
+    }
+
+    // ------------------------------------------------------------ 弹幕屏蔽
+
+    /// 一条协议报文的原文 -> 进列表。测试里全走 `feed_danmu`，
+    /// 也就是 `event_loop` 里收弹幕那条路（历史弹幕进的也是它）。
+    fn feed_raw(app: &mut App, cfg: &Config, raw: &str) {
+        let m = parse_message(raw.as_bytes(), SystemTime::now()).expect("这条报文该认得出来");
+        app.feed_danmu(&m, cfg);
+    }
+
+    /// 端到端：一串真报文（广播 / 连击 / 聊天 / 真送礼）从解析到进列表走一遍，
+    /// 留下的只该是聊天和真送礼 —— 默认屏蔽就是冲「广播刷屏把自己发的埋掉」去的。
+    #[test]
+    fn blocking_drops_room_broadcasts_and_keeps_the_chat() {
+        let cfg = Config::default();
+        let mut app = App::default();
+        // 头两条就是截图里那种房间广播的形状（作者显示成 system）
+        feed_raw(
+            &mut app,
+            &cfg,
+            r#"{"cmd":"NOTICE_MSG","msg_self":"<%持续充能%>投喂<%弥实斯缪拉%>1个沧月神玺，快来围观"}"#,
+        );
+        feed_raw(
+            &mut app,
+            &cfg,
+            r#"{"cmd":"COMBO_SEND","data":{"uname":"胖兔叽大王","r_uname":"三条","combo_num":1,"gift_name":"22号机"}}"#,
+        );
+        // 自己发的聊天、以及真有人送礼，都得留着
+        feed_raw(
+            &mut app,
+            &cfg,
+            r#"{"cmd":"DANMU_MSG","info":[[],"111",[7,"tc191"]]}"#,
+        );
+        feed_raw(
+            &mut app,
+            &cfg,
+            r#"{"cmd":"SEND_GIFT","data":{"uname":"小红","num":1,"giftName":"辣条"}}"#,
+        );
+
+        let out = flat(&render(&app, &cfg, 120, 30));
+        assert!(out.contains(&flat("111")), "聊天不该被埋掉：{out}");
+        assert!(
+            out.contains(&flat("投喂了 1 个 辣条")),
+            "真送礼也得留着：{out}"
+        );
+        assert!(!out.contains(&flat("沧月神玺")), "房间广播该被挡掉：{out}");
+        assert!(!out.contains(&flat("22号机")), "连击送礼也该被挡掉：{out}");
+        assert_eq!(app.blocked, 2, "挡下来几条要数着");
+        assert!(
+            out.contains(&flat("已屏蔽 2 条")),
+            "标题要说清楚挡掉了几条：{out}"
+        );
+    }
+
+    /// 程序自己那几句话**永远不被屏蔽**：把默认那套塞满，再配上关键词和用户名，
+    /// 「弹幕服务器已断开，正在重连」照样得在屏幕上 —— 它被自己吃掉的话，
+    /// 用户看到的现象是「程序坏了」。
+    #[test]
+    fn our_own_messages_are_never_blocked() {
+        let cfg = Config {
+            block: crate::config::Block {
+                types: vec!["LOCAL".into(), "NOTICE_MSG".into(), "SYSTEM".into()],
+                keywords: vec!["断开".into()],
+                users: vec!["system".into()],
+            },
+            ..Config::default()
+        };
+        let mut app = App::default();
+        app.feed_danmu(&DanmuMsg::local("弹幕服务器已断开，正在重连"), &cfg);
+
+        let out = flat(&render(&app, &cfg, 120, 30));
+        assert!(out.contains(&flat("弹幕服务器已断开，正在重连")), "{out}");
+        assert_eq!(app.blocked, 0, "本地提示不许算进屏蔽数");
+        assert!(!out.contains(&flat("已屏蔽")), "一条都没挡就别写这句：{out}");
+    }
+
+    /// 关键词（包含、忽略大小写）和用户名（完全相等）在那条链路上一视同仁：
+    /// **历史弹幕那批**也一样要拦得住 —— 它跟实时的是同一个入口（`DANMU_MSG`），
+    /// 不然现象会是「刚进房间还是满屏，过一会儿才干净」。
+    #[test]
+    fn keywords_and_users_filter_history_and_live_alike() {
+        let cfg = Config {
+            block: crate::config::Block {
+                // 这一条先让开，单看另外两条
+                types: Vec::new(),
+                keywords: vec![" 抽奖 ".into()],
+                users: vec!["小明".into()],
+            },
+            ..Config::default()
+        };
+        let mut app = App::default();
+        // 「历史弹幕」那批：`fetch_history` 里长得就是普通聊天
+        app.feed_danmu(&danmu("路人".into(), "快来抽奖啊".into()), &cfg);
+        app.feed_danmu(&danmu("小明".into(), "正常聊天".into()), &cfg);
+        // 之后实时来的
+        app.feed_danmu(&danmu("小红".into(), "HELLO 大家好".into()), &cfg);
+        app.feed_danmu(&danmu("小明".into(), "又来一条".into()), &cfg);
+
+        let out = flat(&render(&app, &cfg, 120, 30));
+        assert!(out.contains(&flat("HELLO 大家好")), "没命中的照留：{out}");
+        assert!(!out.contains(&flat("抽奖")), "关键词命中的，历史那批也得挡：{out}");
+        assert!(!out.contains(&flat("正常聊天")), "用户名完全相等才算：{out}");
+        assert!(!out.contains(&flat("又来一条")), "同一个人的新弹幕也挡");
+        assert_eq!(app.blocked, 3);
+    }
+
+    /// 上翻时标题那两句都要在：既要说「现在看的不是最新」，也要说屏蔽走了几条。
+    #[test]
+    fn the_title_shows_the_blocked_count_while_scrolled_up() {
+        let cfg = Config::default();
+        let mut app = App::default();
+        let screen = Rect::new(0, 0, 120, 30);
+        for _ in 0..5 {
+            feed_raw(&mut app, &cfg, r#"{"cmd":"NOTICE_MSG","msg_self":"广播"}"#);
+        }
+        for i in 0..60 {
+            app.push_danmu(&danmu(format!("人{i}"), format!("第{i}条")), &cfg);
+        }
+        wheel_at(&mut app, screen, MouseEventKind::ScrollUp);
+
+        let out = flat(&render(&app, &cfg, 120, 30));
+        assert!(out.contains(&flat("已上翻 3 行")), "{out}");
+        assert!(out.contains(&flat("已屏蔽 5 条")), "{out}");
     }
 
     #[test]

@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
             "还没设置直播间号：把 {} 里的 room_id 改成你要看的房间",
             config::Config::path()?.display()
         );
-        let _ = danmu_tx.send(DanmuMsg::system(hint)).await;
+        let _ = danmu_tx.send(DanmuMsg::local(hint)).await;
     }
 
     ui::run(
