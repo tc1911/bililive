@@ -108,6 +108,17 @@ impl Config {
         cfg.save_to(path)
     }
 
+    /// 退出登录：把 `cookie` 清成空串，**别的字段一个都不许动**。
+    ///
+    /// 形状跟 `save_area` 一样，同样是**先重读一遍再写**。退出登录常常发生在
+    /// 「刚选完分区 / 刚改过房间号」之后，拿内存里那份启动时的配置整个覆盖上去，
+    /// 就等于把用户刚改的东西一起冲掉了 —— 而界面看着一切正常。
+    pub fn clear_cookie(path: &Path) -> Result<()> {
+        let mut cfg = Config::load_or_create(Some(path))?;
+        cfg.cookie = String::new();
+        cfg.save_to(path)
+    }
+
     pub fn path() -> Result<PathBuf> {
         let base = match std::env::var_os("XDG_CONFIG_HOME") {
             Some(v) if !v.is_empty() => PathBuf::from(v),
@@ -181,6 +192,92 @@ mod tests {
         assert_eq!(back.cookie, "SESSDATA=fresh", "写回分区前必须重读一遍文件");
         assert_eq!(back.area_id, 235);
         assert_eq!(back.room_id, 6);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 退出登录只许清 `cookie`：文件里除了那一行，别的行必须**逐字节**还是原样。
+    /// 用户退出登录多半是为了换个账号重扫，把他刚选的分区 / 房间号 / OBS 设置
+    /// 一起冲掉，等于为了换个登录态把配置重置了一遍。
+    #[test]
+    fn clear_cookie_empties_only_that_field() {
+        let path = temp_path("clear-cookie");
+        let cfg = Config {
+            cookie: "SESSDATA=abc; bili_jct=def; DedeUserID=7".into(),
+            room_id: 9527,
+            area_id: 371,
+            area_name: "虚拟主播/虚拟日常".into(),
+            obs_fill: false,
+            obs_host: "192.168.1.9".into(),
+            obs_port: 4455,
+            obs_password: "hunter2".into(),
+            single_line: false,
+            show_time: false,
+        };
+        cfg.save_to(&path).unwrap();
+
+        let before = std::fs::read_to_string(&path).unwrap();
+        Config::clear_cookie(&path).unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        let cookie_line = |text: &str| {
+            text.lines()
+                .find(|l| l.trim_start().starts_with("cookie"))
+                .map(str::to_string)
+        };
+        assert_eq!(cookie_line(&after).as_deref(), Some("cookie = \"\""));
+
+        let rest = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|l| !l.trim_start().starts_with("cookie"))
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(
+            rest(&before),
+            rest(&after),
+            "除了 cookie 那一行，别的行必须逐字节没变"
+        );
+
+        // 再解析一遍：文件长得一样，值也得一样
+        let back = Config::load_or_create(Some(&path)).unwrap();
+        assert_eq!(back.cookie, "", "cookie 该是空的");
+        assert_eq!(back.room_id, 9527);
+        assert_eq!(back.area_id, 371);
+        assert_eq!(back.area_name, "虚拟主播/虚拟日常");
+        assert_eq!(back.obs_host, "192.168.1.9");
+        assert_eq!(back.obs_port, 4455);
+        assert_eq!(back.obs_password, "hunter2");
+        assert!(!back.obs_fill);
+        assert!(!back.single_line);
+        assert!(!back.show_time);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 跟 `save_area` 同理：清 cookie 之前必须重读文件。
+    /// 内存里那份是启动时读的，中途可能已经有过一轮登录 / 改房间号落了盘 ——
+    /// 整份覆盖回去，用户会看到「刚退完登录，分区和房间号变回默认值了」。
+    #[test]
+    fn clear_cookie_rereads_the_file_before_writing() {
+        let path = temp_path("clear-cookie-reread");
+        Config {
+            cookie: "SESSDATA=stale".into(),
+            ..Config::default()
+        }
+        .save_to(&path)
+        .unwrap();
+
+        // 模拟「用户刚在别处改过房间号」：另一条链路往同一个文件里写了新的值
+        let mut later = Config::load_or_create(Some(&path)).unwrap();
+        later.room_id = 6;
+        later.area_id = 235;
+        later.save_to(&path).unwrap();
+
+        Config::clear_cookie(&path).unwrap();
+
+        let back = Config::load_or_create(Some(&path)).unwrap();
+        assert_eq!(back.cookie, "", "该清的清掉了");
+        assert_eq!(back.room_id, 6, "清 cookie 之前必须重读一遍文件");
+        assert_eq!(back.area_id, 235);
         let _ = std::fs::remove_file(&path);
     }
 }

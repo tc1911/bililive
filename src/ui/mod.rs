@@ -76,6 +76,12 @@ pub struct Wiring {
     pub login_start: Sender<()>,
     /// 登录任务 -> 界面
     pub login_events: Receiver<LoginEvent>,
+    /// 界面 -> 会话任务：退出登录（清掉本地凭据 + 重启弹幕那条链路）。
+    ///
+    /// 跟扫码那条分开走：扫出来的新凭据是「有一串 cookie 要落盘并换上去」，
+    /// 退出是「把凭据清掉再重启链路」，落点一样但动作相反，
+    /// 挤进同一条 `Sender<String>` 就得拿空串当暗号（谁都不愿意读这种代码）。
+    pub logout: Sender<()>,
     /// 界面 -> 分区任务：拉分区表 / 选定分区
     pub area: Sender<AreaRequest>,
     /// 分区任务 -> 界面
@@ -332,6 +338,7 @@ async fn event_loop(
         send: send_tx,
         login_start,
         login_events: mut login_rx,
+        logout: logout_tx,
         area: area_tx,
         area_events: mut area_rx,
         info: info_tx,
@@ -401,6 +408,15 @@ async fn event_loop(
                             // 队列只有一格：扫码任务正忙的时候再按就丢。
                             // 说一句，比让用户对着一个没反应的键连按强。
                             app.control.set_message("扫码任务正忙，等它一下再看看");
+                        }
+                    }
+                    // 退出登录在会话任务那边落地：清内存凭据、清配置里那一行、
+                    // 重启弹幕那条链路（界面自己一件都不干）。
+                    Action::Logout => {
+                        if logout_tx.try_send(()).is_err() {
+                            // 队列一格。没送出去就得把「正在退出」放掉，
+                            // 不然以后再按会被自己挡住，而那个请求根本不存在。
+                            app.control.logout_dropped();
                         }
                     }
                     Action::LoadAreas => {
@@ -1139,7 +1155,9 @@ mod tests {
             "分区",
             "直播间信息",
             "推流码",
-            "回车 重新扫码",
+            "回车 执行",
+            "重新扫码",
+            "退出登录",
             "未登录（回车扫码）",
         ] {
             assert!(
@@ -1200,9 +1218,15 @@ mod tests {
 
     /// 找到带 ▸ 的那一行，并确认全屏只有这一行有 ——
     /// 两个 ▸ 的话用户根本不知道选的是谁。
+    ///
+    /// 只看左栏那 16 格：右栏自己也会用 ▸（账号栏的两个选项、直播间信息栏的两行
+    /// 字段都是这个标记），全屏只剩一个 ▸ 已经不是现在这条规矩了。
     fn mark_row<'a>(rows: &[&'a str]) -> &'a str {
-        let marked: Vec<&&str> = rows.iter().filter(|l| l.contains('▸')).collect();
-        assert_eq!(marked.len(), 1, "▸ 只该出现在当前那一项上：\n{rows:?}");
+        let marked: Vec<&&str> = rows
+            .iter()
+            .filter(|l| first_cells(l, 16).contains('▸'))
+            .collect();
+        assert_eq!(marked.len(), 1, "左栏 ▸ 只该出现在当前那一项上：\n{rows:?}");
         marked[0]
     }
 

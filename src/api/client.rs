@@ -510,6 +510,27 @@ mod tests {
         assert_eq!(srv.hits().len(), 2, "换凭据之后 nav 该重新问一次");
     }
 
+    /// 退出登录就是「换上一套空凭据」：内存里那两块（`Mutex<Auth>` 和 nav 缓存）
+    /// 都得跟着空掉。漏掉任何一块，界面说「已退出」，请求却还带着旧身份出去 ——
+    /// 那是最难查的一种：看着退了，其实没退。
+    #[tokio::test]
+    async fn clearing_the_cookie_forgets_the_credentials_in_memory() {
+        let c = BiliClient::new("SESSDATA=s; bili_jct=tok; DedeUserID=7").unwrap();
+        assert!(c.logged_in().await);
+        assert_eq!(c.csrf().await.as_deref(), Some("tok"));
+        // 请求上挂着的那个头值（预校验过的那份），只有它不为空才真的会带 Cookie 出去
+        assert!(c.auth.lock().await.header.is_some());
+
+        c.set_cookie("").await;
+        assert!(!c.logged_in().await, "空串之后就不该再算已登录");
+        assert!(c.csrf().await.is_none(), "发弹幕的令牌也得跟着没");
+        assert!(c.auth.lock().await.header.is_none(), "请求上不能再挂旧 Cookie");
+
+        // nav 缓存：`set_cookie` 里一并清掉（上面那条测试钉的是「换凭据」，
+        // 这里钉住「清凭据」走的是同一个口子，不是另开一条路）
+        assert!(c.nav.lock().await.is_none());
+    }
+
     /// 值里混进换行时要清掉：它会被拼进请求体，带 `\r` 发出去服务端认不出来。
     #[test]
     fn cookie_value_strips_control_chars() {

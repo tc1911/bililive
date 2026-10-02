@@ -4,7 +4,7 @@
 //! 右栏带边框且标题是当前栏的名字）：
 //!
 //!     +-- 按键提示 ------------------------------+
-//!     | 回车 重新扫码 ...                          |
+//!     | ↑↓ 选一项  回车 执行 ...                    |
 //!     | 最近一条消息                               |
 //!     +--------------+---------------------------+
 //!     | > 账号       |                           |
@@ -18,13 +18,19 @@
 //! 按键分工照 Go 版 `ui/control/control.go`，别串：
 //!   - `Shift+Tab` 在弹幕页和配置页之间来回切
 //!   - `Tab` 在配置页里换功能栏；**弹幕页上绝对不能抢**，那是输入框的键
-//!   - `↑↓` 在栏里选；账号 / 推流码这两栏没有可上下选的东西，就顺手拿来换栏
+//!   - `↑↓` 在栏里选（账号栏选「重新扫码 / 退出登录」、直播间信息栏选字段、
+//!     分区栏在树里走）；推流码栏没有可上下选的东西，就顺手拿来换栏
 //!   - `←→`：只在分区栏有意义，收起 / 展开光标那一行
-//!   - `回车`：账号栏重新扫码；直播间信息栏进编辑 / 提交；分区栏选定 / 展开收起
+//!   - `回车`：账号栏执行选中那一项（重新扫码 / 退出登录 —— 退出登录先过确认层）；
+//!     直播间信息栏进编辑 / 提交；分区栏选定 / 展开收起；推流码栏重查开播状态
 //!   - `Esc`：取消编辑 → 收起配置页，退到弹幕页就**停住**，退出只有 Ctrl+C
 //!   - `F2` / `F3` / `F6` 直接翻开配置页并跳到账号 / 分区 / 直播间信息
 //!   - `F4` 开播（**先弹确认层**，确认了才真发请求）/ `F5` 下播（不用确认）。
 //!     这两个跟 `Ctrl+R` 一样是全局的，两页里都能按
+//!
+//! 屏幕上那个确认层（居中带边框、默认落在「取消」）归**两件事**用：开播和退出登录。
+//! 它俩都是「手滑一下代价太大、而且事后不好收场」的那种，所以按钮 / 文案不同、
+//! 规矩完全一样（`Tab`/`←→` 选、`回车` 执行、`Esc` 取消）。
 //!
 //! 这里只改界面状态，不碰网络也不碰磁盘 —— 那三件事分别归 `api::login`、`api::area`
 //! 和 main（写回配置也是往通道里扔一个 `Action`，自己不落盘）。
@@ -80,7 +86,7 @@ impl Tab {
     pub fn hint(self) -> &'static str {
         match self {
             Tab::Account => {
-                "回车 重新扫码    Ctrl+R 刷新房间信息    Tab 换功能    Shift+Tab 回弹幕页    Esc 返回"
+                "↑↓ 选一项    回车 执行    Ctrl+R 刷新房间信息    Tab 换功能    Shift+Tab 回弹幕页    Esc 返回"
             }
             Tab::Area => {
                 "↑↓ 选分区    ←→ 展开/收起    回车 确认该分区    Tab 换功能    Shift+Tab 回弹幕页"
@@ -134,30 +140,104 @@ pub enum Action {
     StartLive { area_v2: i64 },
     /// 下播（不用确认）
     StopLive,
+    /// 退出登录：把本地凭据清掉（内存里的 + 配置里的）+ 重启弹幕那条链路。
+    ///
+    /// **只有走完确认层**（确认层里选了「退出登录」再回车）才会出这一条：
+    /// 清掉之后到重新扫码之前，弹幕是断的。
+    Logout,
 }
 
-/// 开播确认层的默认按钮。**默认落在「取消」上**：开播不可逆（直播间立刻对外可见、
-/// 粉丝收到推送），一个手滑的回车就出去的代价太大，宁可多按一下。
-const CONFIRM_BUTTONS: [&str; 2] = ["开播", "取消"];
+/// 账号栏的两个动作。
+///
+/// 从前这一栏只有「重新扫码」一件事，`↑↓` 就被顺手拿去换栏了。现在有两件事，
+/// 换栏归 `Tab`，`↑↓` 得让给选行 —— 跟「直播间信息」栏一个样子。
+const ACCOUNT_ITEMS: [&str; 2] = ["重新扫码", "退出登录"];
+/// 每一项后面那句灰字说明。
+///
+/// 第一句写的正是那个坑：**cookie 还有效时回车不出码**（`login_loop` 会回
+/// 「已登录，无需重复扫码」），于是想换账号只能拿临时配置绕（`-c /tmp/x.toml`）——
+/// 第二项就是给这条路准备的。
+const ACCOUNT_NOTES: [&str; 2] = ["cookie 失效了换一张", "清掉本地凭据"];
+/// 「退出登录」在 `ACCOUNT_ITEMS` 里的下标。
+const ACCOUNT_LOGOUT: usize = 1;
+
+/// 确认层里「取消」的下标。两个框的按钮都是「干活的那个 + 取消」，取消都在最后，
+/// 所以共用一个下标。
+///
+/// **默认落在「取消」上**：开播不可逆（直播间立刻对外可见、粉丝收到推送），
+/// 退出登录会让弹幕断到重新扫码为止 —— 两个都是手滑一个回车代价太大的事，
+/// 宁可多按一下。
 const CONFIRM_CANCEL: usize = 1;
 
-/// 确认层的文案，照 Go 版一字不改；拆行只是为了那个框画得下，连起来读还是那一句
+/// 开播确认层的文案，照 Go 版一字不改；拆行只是为了那个框画得下，连起来读还是那一句
 /// 「开播后直播间会立刻对外可见，粉丝会收到开播推送。确定开播？」。
 /// **别把整句塞成一行**：44 格宽的框里会被截断，而这句话正是要给人看清楚的。
-const CONFIRM_TEXT: [&str; 3] = [
+const CONFIRM_START_TEXT: [&str; 3] = [
     "开播后直播间会立刻对外可见，",
     "粉丝会收到开播推送。",
     "确定开播？",
 ];
 
-/// 开播确认层。`selected` 是 `CONFIRM_BUTTONS` 的下标。
-struct ConfirmStart {
+/// 退出登录确认层的文案。要说清楚**后果**：退出之后到这个账号重新扫码登录之前，
+/// 弹幕是断的（凭据清了，弹幕那条 wss 也整条重启了）。
+/// 同样是拆成三行 —— 44 格的框里放不下一整句。
+const CONFIRM_LOGOUT_TEXT: [&str; 3] = [
+    "退出登录会清掉本地保存的 Cookie，",
+    "在你重新扫码登录之前，弹幕会断开。",
+    "确定退出登录？",
+];
+
+/// 确认层问的是哪件事。
+///
+/// 两件事共用同一个框（居中带边框、`Tab`/`←→` 选按钮、`回车` 确认、`Esc` 取消、
+/// 默认落在「取消」），只是标题 / 文案 / 按钮不同。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmKind {
+    StartLive,
+    Logout,
+}
+
+impl ConfirmKind {
+    fn title(self) -> &'static str {
+        match self {
+            ConfirmKind::StartLive => " 开播确认 ",
+            ConfirmKind::Logout => " 退出登录确认 ",
+        }
+    }
+
+    fn text(self) -> &'static [&'static str] {
+        match self {
+            ConfirmKind::StartLive => &CONFIRM_START_TEXT,
+            ConfirmKind::Logout => &CONFIRM_LOGOUT_TEXT,
+        }
+    }
+
+    fn buttons(self) -> &'static [&'static str] {
+        match self {
+            ConfirmKind::StartLive => &["开播", "取消"],
+            ConfirmKind::Logout => &["退出登录", "取消"],
+        }
+    }
+
+    /// 取消之后顶栏那一句话。
+    fn cancelled(self) -> &'static str {
+        match self {
+            ConfirmKind::StartLive => "已取消开播",
+            ConfirmKind::Logout => "已取消退出登录",
+        }
+    }
+}
+
+/// 确认层。`selected` 是 `kind.buttons()` 的下标。
+struct Confirm {
+    kind: ConfirmKind,
     selected: usize,
 }
 
-impl Default for ConfirmStart {
-    fn default() -> Self {
+impl Confirm {
+    fn new(kind: ConfirmKind) -> Self {
         Self {
+            kind,
             selected: CONFIRM_CANCEL,
         }
     }
@@ -233,6 +313,13 @@ pub struct Control {
     qr: Vec<Line<'static>>,
     /// 正在等扫码。这期间回车不重复生成：屏幕上两张二维码，用户扫了哪张都说不清。
     login_pending: bool,
+    /// 账号栏选中的是哪一项（`ACCOUNT_ITEMS` 的下标）。
+    ///
+    /// 默认停在「重新扫码」上：这一栏进来的绝大多数人是码失效了要换一张，
+    /// 而「退出登录」是个清凭据的破坏性动作，不该是回车的第一落点。
+    account_idx: usize,
+    /// 退出登录请求还在路上（界面 -> 会话任务）。这期间不再发第二次。
+    logout_pending: bool,
     /// 「直播间信息」栏选中的是哪一行
     field_idx: usize,
     /// 正在编辑时的缓冲，`None` 表示没在编辑
@@ -266,8 +353,8 @@ pub struct Control {
     /// OBS 联动那件事的结果（填好了 / 没填上的原话），摆在推流码栏末尾。
     /// 空 = 还没发生（关掉了联动、还没开播、或者那条任务还没回话）。
     obs_note: String,
-    /// 开播确认层开着的时候是 `Some`
-    confirm: Option<ConfirmStart>,
+    /// 确认层（开播 / 退出登录共用一个框）开着的时候是 `Some`
+    confirm: Option<Confirm>,
     /// 开播 / 下播请求还在路上。这期间不再发第二次（连按 F4/F5 只会被顶栏那句话挡住）
     start_pending: bool,
     stop_pending: bool,
@@ -283,6 +370,8 @@ impl Default for Control {
             logged_in: false,
             qr: Vec::new(),
             login_pending: false,
+            account_idx: 0,
+            logout_pending: false,
             field_idx: 0,
             edit: None,
             title: String::new(),
@@ -434,6 +523,9 @@ impl Control {
                 self.logged_in = false;
                 self.account = reason;
                 self.login_pending = false;
+                // 退出登录那件事（或者登录态真的失效了）到这就算落地了，
+                // 把「正在退出」放掉，不然以后再按「退出登录」会被自己挡住。
+                self.logout_pending = false;
             }
             LoginEvent::Qr(content) => {
                 self.show_qr(&content, "用哔哩哔哩 App 扫码登录");
@@ -693,7 +785,9 @@ impl Control {
             // **不是退出**，退出只有 Ctrl+C。
             KeyCode::Esc => self.close(),
             KeyCode::Enter => match self.tab {
-                Tab::Account => return Action::StartLogin,
+                // 账号栏：执行选中那一项（重新扫码 / 退出登录）。
+                // 「退出登录」先弹确认层，不是按了就清。
+                Tab::Account => return self.account_enter(),
                 Tab::Info => self.start_edit(),
                 // 分区栏：停在子分区上 = 选定它（把 area_id / area_name 传出去写回配置）；
                 // 停在父分区或「全部分区」上 = 展开 / 收起，跟 ←→ 一个意思。
@@ -704,14 +798,16 @@ impl Control {
             KeyCode::Up | KeyCode::Down => {
                 let d = if code == KeyCode::Up { -1 } else { 1 };
                 match self.tab {
+                    // 账号栏：在「重新扫码 / 退出登录」两项里选
+                    Tab::Account => self.move_account(d),
                     // 直播间信息栏：上下是在栏里选一项
                     Tab::Info => self.move_field(d),
                     // 分区栏：在**可见的行**里上下走。父分区也是可停的一行 ——
                     // Go 版只让光标停在「可选节点」上，父分区不可选就被整段跳过去，
                     // 用户报的是「分区没法选」。
                     Tab::Area => self.area_move(d),
-                    // 账号 / 推流码这两栏本来没有可上下选的东西，就顺手拿来换栏
-                    Tab::Account | Tab::Stream => return self.cycle_tab(d),
+                    // 推流码栏没有可上下选的东西，就顺手拿来换栏
+                    Tab::Stream => return self.cycle_tab(d),
                 }
             }
             // 分区栏的 ←→：收起 / 展开光标那一行。
@@ -880,7 +976,7 @@ impl Control {
             self.set_message("已经开播了（下播按 F5）");
             return Action::Handled;
         }
-        self.confirm = Some(ConfirmStart::default());
+        self.confirm = Some(Confirm::new(ConfirmKind::StartLive));
         Action::Handled
     }
 
@@ -907,25 +1003,72 @@ impl Control {
         Action::StopLive
     }
 
+    /// 账号栏的回车：执行选中那一项。
+    ///
+    /// 「重新扫码」就是**以前那个行为**，一个字都没改：已经登录且凭据还灵的时候
+    /// `login_loop` 会回一句「已登录，无需重复扫码」，不出新码 —— 想换账号得先
+    /// 「退出登录」，不然屏幕上什么都不会发生，用户只会以为这键坏了。
+    ///
+    /// 「退出登录」**先过确认层**：清掉凭据之后弹幕就断了，还得重新扫码，
+    /// 跟开播一样属于「手滑一下代价太大」的事，不能按了就干。
+    fn account_enter(&mut self) -> Action {
+        if self.account_idx != ACCOUNT_LOGOUT {
+            return Action::StartLogin;
+        }
+        if self.logout_pending {
+            self.set_message("退出登录还在进行中，等一下…");
+            return Action::Handled;
+        }
+        self.confirm = Some(Confirm::new(ConfirmKind::Logout));
+        Action::Handled
+    }
+
+    /// 账号栏 `↑↓` 选一项（两项，到头绕回去，跟「直播间信息」栏一个口径）。
+    fn move_account(&mut self, d: i32) {
+        let n = ACCOUNT_ITEMS.len() as i32;
+        self.account_idx = ((self.account_idx as i32 + d).rem_euclid(n)) as usize;
+    }
+
+    /// 那一下没能送进会话任务（队列满 / 任务没了）。
+    ///
+    /// 跟 `live_request_dropped` 一个道理：不放掉「正在退出」的话，之后再按
+    /// 「退出登录」只会被自己挡住（顶栏说「还在进行中」，而那个请求根本不存在）。
+    pub fn logout_dropped(&mut self) {
+        self.logout_pending = false;
+        self.set_message("退出登录请求没送出去（会话任务正忙），再按一次试试");
+    }
+
     /// 确认层里的按键：`Tab` / `←→` 换按钮，`回车` 按下去，`Esc` 取消。
+    /// 这一套开播和退出登录共用，只有按钮和文案不同。
     fn confirm_key(&mut self, code: KeyCode) -> Action {
-        let last = CONFIRM_BUTTONS.len() - 1;
+        // 框不在手上时按到这儿（理论上到不了）：按「取消」处理，什么都别干。
+        let kind = self.confirm.as_ref().map_or(ConfirmKind::StartLive, |c| c.kind);
+        let last = kind.buttons().len() - 1;
         match code {
             KeyCode::Enter => {
                 let selected = self.confirm.take().map_or(CONFIRM_CANCEL, |c| c.selected);
                 if selected == CONFIRM_CANCEL {
-                    self.set_message("已取消开播");
+                    self.set_message(kind.cancelled());
                     return Action::Handled;
                 }
-                self.start_pending = true;
-                self.set_message("正在开播…");
-                Action::StartLive {
-                    area_v2: self.saved_area_id,
+                match kind {
+                    ConfirmKind::StartLive => {
+                        self.start_pending = true;
+                        self.set_message("正在开播…");
+                        Action::StartLive {
+                            area_v2: self.saved_area_id,
+                        }
+                    }
+                    ConfirmKind::Logout => {
+                        self.logout_pending = true;
+                        self.set_message("正在退出登录…");
+                        Action::Logout
+                    }
                 }
             }
             KeyCode::Esc => {
                 self.confirm = None;
-                self.set_message("已取消开播");
+                self.set_message(kind.cancelled());
                 Action::Handled
             }
             KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
@@ -1110,15 +1253,15 @@ pub fn draw(f: &mut Frame, c: &Control, area: Rect) {
     // 确认层画在最上层：它得盖住底下的栏。先 `Clear` 再画框 —— 不清的话
     // 框里会透出下面那层的文字（半句标题混在确认文案里就没法看了）。
     if let Some(confirm) = &c.confirm {
-        draw_confirm(f, area, confirm.selected);
+        draw_confirm(f, area, confirm);
     }
 }
 
-/// 开播确认层：屏幕正中的一个带边框的框、两行文案、一排按钮。
+/// 确认层：屏幕正中的一个带边框的框、三行文案、一排按钮。
 ///
 /// 自己在 ratatui 里搭（Go 版用 tview 的 Modal）：需要的东西就这一个框，
 /// 为它铺一层 Pages 不值当。选中的按钮反色，另一个是灰的。
-fn draw_confirm(f: &mut Frame, area: Rect, selected: usize) {
+fn draw_confirm(f: &mut Frame, area: Rect, confirm: &Confirm) {
     // 宽 44 格够放下最长那行文案；终端比它还窄就跟着缩，缩到画不下干脆不画
     //（画一半的框比没有框更让人看不明白）。
     let width = 44.min(area.width);
@@ -1126,6 +1269,7 @@ fn draw_confirm(f: &mut Frame, area: Rect, selected: usize) {
     if width < 12 || height < 5 {
         return;
     }
+    let text = confirm.kind.text();
     let rect = Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1135,27 +1279,27 @@ fn draw_confirm(f: &mut Frame, area: Rect, selected: usize) {
 
     f.render_widget(Clear, rect);
     let block = Block::bordered()
-        .title(" 开播确认 ")
+        .title(confirm.kind.title())
         .style(Style::default().fg(Color::Yellow));
     let inner = block.inner(rect);
     f.render_widget(block, rect);
+    // 文案几行由 `ConfirmKind::text` 说了算，别在这儿写死下标 ——
+    // 少一行是个空框，多一行会被框裁掉（退出登录那句后果就白写了）。
+    let mut lines: Vec<Line<'static>> =
+        text.iter().map(|l| Line::from(l.to_string())).collect();
+    lines.push(Line::from(""));
+    lines.push(button_line(confirm.kind, confirm.selected));
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(CONFIRM_TEXT[0]),
-            Line::from(CONFIRM_TEXT[1]),
-            Line::from(CONFIRM_TEXT[2]),
-            Line::from(""),
-            button_line(selected),
-        ])
-        .alignment(Alignment::Center),
+        Paragraph::new(lines).alignment(Alignment::Center),
         inner,
     );
 }
 
-/// `[ 开播 ]  [ 取消 ]`，选中的那个反色 —— 不反色就看不出回车会按到哪个。
-fn button_line(selected: usize) -> Line<'static> {
+/// `[ 开播 ]  [ 取消 ]`（退出登录那个框是 `[ 退出登录 ]  [ 取消 ]`），
+/// 选中的那个反色 —— 不反色就看不出回车会按到哪个。
+fn button_line(kind: ConfirmKind, selected: usize) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, label) in CONFIRM_BUTTONS.iter().enumerate() {
+    for (i, label) in kind.buttons().iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("  "));
         }
@@ -1250,8 +1394,14 @@ fn with_saved(note: &str, saved: &str) -> String {
 }
 
 fn draw_account(f: &mut Frame, c: &Control, area: Rect) {
-    // 账号那行占两行（Go 版的 accountView 也是 2），下面全留给二维码
-    let [who, code] = Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(area);
+    // 账号那行占两行（Go 版的 accountView 也是 2），接着是两个可选项，
+    // 剩下全留给二维码
+    let [who, items, code] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Length(ACCOUNT_ITEMS.len() as u16),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("账号: ", Style::default().fg(Color::Gray)),
@@ -1266,6 +1416,7 @@ fn draw_account(f: &mut Frame, c: &Control, area: Rect) {
         ])),
         who,
     );
+    f.render_widget(Paragraph::new(account_items(c)), items);
     if !c.qr.is_empty() {
         // 逐行居中：每行宽度一样，画出来就是正的。
         // 码比这一格宽的话 ratatui 会截断，跟 Go 版一样（终端太小就扫不动，认了）。
@@ -1274,6 +1425,38 @@ fn draw_account(f: &mut Frame, c: &Control, area: Rect) {
             code,
         );
     }
+}
+
+/// 账号栏那两个可选项：选中的那行带 `▸`（跟「直播间信息」栏一个套路），
+/// 后面跟一句灰字说明它干什么。
+///
+/// 不反色、只靠 `▸` + 黄色：这一栏下面往往摆着一张二维码，一条反色的横杠会把
+/// 视线从码上抢走（分区树那种整行反色，是因为那一栏本来就全是文字）。
+fn account_items(c: &Control) -> Vec<Line<'static>> {
+    ACCOUNT_ITEMS
+        .iter()
+        .zip(ACCOUNT_NOTES)
+        .enumerate()
+        .map(|(i, (label, note))| {
+            let selected = c.account_idx == i;
+            Line::from(vec![
+                Span::styled(
+                    if selected {
+                        format!("▸ {label}")
+                    } else {
+                        format!("  {label}")
+                    },
+                    Style::default().fg(if selected {
+                        Color::Yellow
+                    } else {
+                        Color::Gray
+                    }),
+                ),
+                Span::raw("  "),
+                Span::styled(note, Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect()
 }
 
 /// 「推流码」栏：手上有凭据就把服务器 / 密钥摆出来，否则按最近一次状态查询写一句话。
@@ -1523,17 +1706,19 @@ mod tests {
         assert_eq!(c.page(), Page::Config, "换栏又不是收起来");
     }
 
-    /// 账号 / 推流码这两栏没有可上下选的东西，↑↓ 就拿来换栏；
-    /// 分区栏的 ↑↓ 在分区树里走；直播间信息栏的 ↑↓ 是选字段。
+    /// 每一栏的 ↑↓ 各是各的意思：账号栏在两项里选、分区栏在分区树里走、
+    /// 直播间信息栏选字段；**推流码栏**没有可上下选的东西，就顺手拿来换栏。
     #[test]
     fn up_down_means_different_things_per_tab() {
         let mut c = logged_in();
         c.handle_key(KeyCode::BackTab, NONE); // 账号
         assert_eq!(c.tab(), Tab::Account);
+        assert_eq!(c.account_idx, 0);
         c.handle_key(KeyCode::Up, NONE);
-        assert_eq!(c.tab(), Tab::Stream, "↑ 从账号绕到最后一栏");
+        assert_eq!(c.account_idx, ACCOUNT_LOGOUT, "↑ 选到「退出登录」");
+        assert_eq!(c.tab(), Tab::Account, "账号栏的 ↑↓ 是选行，不换栏");
         c.handle_key(KeyCode::Down, NONE);
-        assert_eq!(c.tab(), Tab::Account, "↓ 再绕回来");
+        assert_eq!(c.account_idx, 0, "两项，到头绕回去");
 
         c.handle_key(KeyCode::Tab, NONE); // 分区
         c.handle_key(KeyCode::Up, NONE);
@@ -1546,6 +1731,16 @@ mod tests {
         assert_eq!(c.tab(), Tab::Info, "选字段不换栏");
         c.handle_key(KeyCode::Down, NONE);
         assert_eq!(c.field_idx, 0, "两项，到头绕回去");
+
+        c.handle_key(KeyCode::Tab, NONE); // 推流码
+        assert_eq!(c.tab(), Tab::Stream);
+        c.handle_key(KeyCode::Up, NONE);
+        assert_eq!(c.tab(), Tab::Info, "推流码栏的 ↑↓ 还是换栏");
+        c.handle_key(KeyCode::Tab, NONE); // 回到推流码
+        assert_eq!(c.tab(), Tab::Stream);
+        c.handle_key(KeyCode::Down, NONE);
+        assert_eq!(c.tab(), Tab::Account, "↓ 从最后一栏绕回第一栏");
+        assert_eq!(c.account_idx, 0, "换栏不许动账号栏里选中的那一项");
     }
 
     /// Esc 是「返回上一层」：编辑中先取消编辑，再按才收起配置页，
@@ -1625,6 +1820,128 @@ mod tests {
         // 已经登录了就别再问接口
         let mut c = logged_in();
         assert_eq!(c.handle_key(KeyCode::BackTab, NONE), Action::Handled);
+    }
+
+    /// 账号栏的两个可选项：`回车` 执行选中那一项。
+    /// 「重新扫码」还是老行为（已登录时不出码那句话保留），
+    /// 「退出登录」先弹确认层 —— 不是按了就清。
+    #[test]
+    fn enter_runs_the_selected_account_item() {
+        let mut c = logged_in();
+        assert_eq!(c.handle_key(KeyCode::BackTab, NONE), Action::Handled);
+        assert_eq!(c.tab(), Tab::Account);
+
+        // 默认停在第一项：重新扫码就是以前那一下
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::StartLogin);
+        assert!(c.confirm.is_none(), "重新扫码不用确认");
+
+        // 第二项：退出登录 —— 先弹确认层，弹出的那一下什么都别干
+        c.handle_key(KeyCode::Down, NONE);
+        assert_eq!(c.account_idx, ACCOUNT_LOGOUT);
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::Handled);
+        assert_eq!(
+            c.confirm.as_ref().map(|m| m.kind),
+            Some(ConfirmKind::Logout),
+            "退出登录得先问一遍"
+        );
+        assert!(!c.logout_pending, "还没确认，什么都不该发生");
+    }
+
+    /// 退出登录的确认层跟开播那个共用一套规矩：默认落在「取消」、`Esc` 不执行、
+    /// 默认那一下 `回车` 也不执行 —— 选到「退出登录」再回车才真清。
+    #[test]
+    fn logging_out_asks_first_and_nothing_happens_until_confirmed() {
+        let mut c = logged_in();
+        c.handle_key(KeyCode::BackTab, NONE);
+        c.handle_key(KeyCode::Down, NONE);
+        c.handle_key(KeyCode::Enter, NONE);
+        assert_eq!(
+            c.confirm.as_ref().map(|m| m.selected),
+            Some(CONFIRM_CANCEL),
+            "默认落在「取消」上"
+        );
+
+        // Esc：只收确认层，凭据一动不动
+        assert_eq!(c.handle_key(KeyCode::Esc, NONE), Action::Handled);
+        assert!(c.confirm.is_none());
+        assert!(!c.logout_pending);
+        assert!(c.message.contains("已取消"), "{}", c.message);
+        assert!(c.logged_in, "取消之后登录态不该变");
+
+        // 默认那一下回车 = 取消：不许冒出 Logout
+        c.handle_key(KeyCode::Enter, NONE); // 再弹一次
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::Handled);
+        assert!(c.confirm.is_none());
+        assert!(!c.logout_pending);
+        assert!(c.logged_in);
+
+        // 选到「退出登录」再回车：这才真执行
+        c.handle_key(KeyCode::Enter, NONE); // 再弹一次
+        assert_eq!(c.handle_key(KeyCode::Left, NONE), Action::Handled);
+        assert_eq!(c.confirm.as_ref().map(|m| m.selected), Some(0));
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::Logout);
+        assert!(c.logout_pending);
+        assert!(c.message.contains("正在退出登录"), "{}", c.message);
+        assert!(c.confirm.is_none(), "确认层得收掉，不然它会一直盖着");
+
+        // 请求还在路上：再按不重复发
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::Handled);
+        assert!(c.message.contains("还在进行中"), "{}", c.message);
+
+        // 那一下没送进会话任务（队列满）时得能重来一次
+        c.logout_dropped();
+        assert!(!c.logout_pending);
+        assert!(c.message.contains("没送出去"), "{}", c.message);
+        assert_eq!(c.handle_key(KeyCode::Enter, NONE), Action::Handled);
+        assert_eq!(
+            c.confirm.as_ref().map(|m| m.kind),
+            Some(ConfirmKind::Logout),
+            "被放掉之后要能重新来一次"
+        );
+    }
+
+    /// 退出登录的确认层一样得吃下别的键：漏到下面就成了「换栏」「收起来」，
+    /// 屏上那个框还开着、其实已经没人管它了。
+    #[test]
+    fn the_logout_confirm_layer_swallows_everything_else() {
+        let mut c = logged_in();
+        c.handle_key(KeyCode::BackTab, NONE);
+        c.handle_key(KeyCode::Down, NONE);
+        c.handle_key(KeyCode::Enter, NONE);
+        let tab = c.tab();
+        for code in [
+            KeyCode::BackTab,
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::F(3),
+            KeyCode::F(4),
+            KeyCode::F(5),
+            KeyCode::Char('x'),
+        ] {
+            assert_eq!(c.handle_key(code, NONE), Action::Handled, "{code:?}");
+        }
+        assert_eq!(
+            c.confirm.as_ref().map(|m| m.kind),
+            Some(ConfirmKind::Logout),
+            "这些键都不该把它关掉"
+        );
+        assert_eq!(c.page(), Page::Config, "也不该把配置页收掉");
+        assert_eq!(c.tab(), tab, "也不该换栏");
+    }
+
+    /// 退出登录落地之后界面上那两样：账号行回到「未登录（回车扫码）」、
+    /// `logged_in` 为假（顶栏那句「去重新扫码」由会话任务说）。
+    #[test]
+    fn after_logout_the_account_line_says_not_logged_in() {
+        let mut c = logged_in();
+        c.on_login_event(LoginEvent::LoggedOut("未登录（回车扫码）".into()));
+        assert!(!c.logged_in);
+        assert_eq!(c.account, "未登录（回车扫码）");
+        assert!(!c.logout_pending, "「正在退出」的旗子得放掉");
+        assert!(!c.login_pending);
+
+        // 退完之后账号栏照旧能再来一遍：没登录、手上又没有码，翻开就自动要一张
+        assert_eq!(c.handle_key(KeyCode::BackTab, NONE), Action::StartLogin);
     }
 
     /// 编辑缓冲按字符走：中文退格退一个整字，光标能回到中间插字。
@@ -2908,5 +3225,105 @@ mod tests {
         let reversed: Vec<&(String, bool)> = rows.iter().filter(|(_, r)| *r).collect();
         assert_eq!(reversed.len(), 1);
         assert!(flat(&reversed[0].0).contains("[开播]"), "{}", reversed[0].0);
+    }
+
+    /// 账号栏那两个可选项画出来了：两项都在、选中那项前面是 `▸`（跟「直播间信息」
+    /// 栏一个套路），`↓` 之后 `▸` 跟着走。
+    #[test]
+    fn the_account_pane_shows_the_two_items_and_marks_the_selected_one() {
+        let mut c = logged_in();
+        c.handle_key(KeyCode::BackTab, NONE);
+        let rows = screen(&c, 100, 30);
+        let text = flat(
+            &rows
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        for want in ["▸重新扫码", "退出登录", "cookie 失效了换一张", "清掉本地凭据"] {
+            assert!(text.contains(&flat(want)), "账号栏缺了「{want}」：\n{text}");
+        }
+        assert!(
+            rows.iter()
+                .any(|(t, _)| flat(t).contains(&flat("▸重新扫码"))),
+            "默认选中的是「重新扫码」：\n{text}"
+        );
+
+        c.handle_key(KeyCode::Down, NONE);
+        let rows = screen(&c, 100, 30);
+        let text = flat(
+            &rows
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        assert!(
+            rows.iter()
+                .any(|(t, _)| flat(t).contains(&flat("▸退出登录"))),
+            "↓ 之后 ▸ 该挪到「退出登录」上：\n{text}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|(t, _)| flat(t).contains(&flat("▸重新扫码"))),
+            "▸ 只该有一个：\n{text}"
+        );
+    }
+
+    /// 退出登录那个框：标题、三行文案（要把后果说清楚）、两个按钮，
+    /// 默认反色的是「取消」。
+    #[test]
+    fn the_logout_confirm_box_says_the_danmaku_will_break() {
+        let mut c = logged_in();
+        c.handle_key(KeyCode::BackTab, NONE);
+        c.handle_key(KeyCode::Down, NONE);
+        c.handle_key(KeyCode::Enter, NONE);
+
+        let rows = screen(&c, 100, 30);
+        let text = flat(
+            &rows
+                .iter()
+                .map(|(t, _)| t.clone())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        for want in [
+            "退出登录确认",
+            "退出登录会清掉本地保存的 Cookie，",
+            "在你重新扫码登录之前，弹幕会断开。",
+            "确定退出登录？",
+            "[退出登录]",
+            "[取消]",
+        ] {
+            assert!(text.contains(&flat(want)), "确认框里缺了「{want}」：\n{text}");
+        }
+
+        let reversed: Vec<&(String, bool)> = rows.iter().filter(|(_, r)| *r).collect();
+        assert_eq!(reversed.len(), 1, "只该有一个按钮反色：\n{rows:#?}");
+        assert!(
+            flat(&reversed[0].0).contains("[取消]"),
+            "默认选中的是「取消」：{}",
+            reversed[0].0
+        );
+    }
+
+    /// 退出登录的框在窄终端下也不许 panic（框比屏幕宽时得自己让位）。
+    #[test]
+    fn drawing_the_logout_confirm_never_panics() {
+        let mut c = logged_in();
+        c.handle_key(KeyCode::BackTab, NONE);
+        c.handle_key(KeyCode::Down, NONE);
+        c.handle_key(KeyCode::Enter, NONE);
+        assert_eq!(c.confirm.as_ref().map(|m| m.kind), Some(ConfirmKind::Logout));
+        for (w, h) in [(120u16, 40u16), (16, 5), (1, 1), (40, 8)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| {
+                let area = f.area();
+                draw(f, &c, area);
+            })
+            .unwrap();
+        }
     }
 }

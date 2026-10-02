@@ -9,7 +9,7 @@ mod obs;
 mod timefmt;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -72,6 +72,9 @@ async fn main() -> Result<()> {
     let (obs_note_tx, obs_note_rx) = mpsc::channel::<String>(4);
     // 登录任务 -> 会话任务：拼好的 Cookie 串。
     let (creds_tx, creds_rx) = mpsc::channel::<String>(1);
+    // 界面 -> 会话任务：退出登录。容量 1，跟手动刷新一个口径 ——
+    // 连按几下也只排一次，而且界面那侧永不阻塞（它跑在事件循环里）。
+    let (logout_tx, logout_rx) = mpsc::channel::<()>(1);
     // 「凭据换过了」的信号。watch 里那个数本身没用，变一下就是信号 ——
     // 弹幕那条链路看到它就整条重来（见 `supervise_danmaku`）。
     let (auth_tx, auth_rx) = watch::channel(0u64);
@@ -87,12 +90,18 @@ async fn main() -> Result<()> {
         login_start_rx,
         login_evt_tx.clone(),
     ));
-    tokio::spawn(apply_login(
+    tokio::spawn(session_task(
         client.clone(),
         cfg_path.clone(),
-        creds_rx,
-        auth_tx,
-        refresh_tx.clone(),
+        CredentialPaths {
+            creds: creds_rx,
+            logout: logout_rx,
+            // 退出登录之后顺手替用户要一张新码，别让他再去找键。
+            // 这个发送端界面那边也留着一份（`Wiring::login_start`），克隆过去就行。
+            login_start: login_start_tx.clone(),
+            auth: auth_tx,
+            refresh: refresh_tx.clone(),
+        },
         login_evt_tx,
     ));
     tokio::spawn(area_task(
@@ -169,6 +178,7 @@ async fn main() -> Result<()> {
             send: send_tx,
             login_start: login_start_tx,
             login_events: login_evt_rx,
+            logout: logout_tx,
             area: area_tx,
             area_events: area_evt_rx,
             info: info_tx,
@@ -486,6 +496,18 @@ async fn canonical_room(
     Ok((id, info))
 }
 
+/// 「凭据变了」—— 弹幕那条链路看到这个信号就整条重来（见 `supervise_danmaku`）。
+///
+/// 单独开一个函数只因为这儿埋着一个**自锁**：写成
+/// `auth.send_replace(auth.borrow().wrapping_add(1))` 时，`borrow()` 的读借用
+/// 会活到整条语句结束，而 `send_replace` 要拿同一把锁的写权 ——
+/// 同一个线程就把自己锁死了（parking_lot 的读写锁不认重入）。
+/// 现象是**扫码登录 / 退出登录成功那一刻进程一声不响地卡住**，界面上什么都不再动。
+/// 原来 `apply_login` 里就是这么写的，这一轮加退出登录时测试才把它逼出来。
+fn signal_credential_change(auth: &watch::Sender<u64>) {
+    auth.send_modify(|v| *v = v.wrapping_add(1));
+}
+
 /// 顺手把封面图抓回来给预览用。
 ///
 /// 抓失败**不算改封面失败**（那一步早就成功了），只让预览那一格写一句话，
@@ -539,54 +561,160 @@ async fn supervise_danmaku(
     }
 }
 
-/// 扫码成功后把新凭据落到三个地方：内存里的 client、磁盘上的 config.toml、
-/// 以及两条正在跑的网络链路。
+/// `session_task` 手上那几条窗户。
 ///
-/// 落盘失败**不算登录失败**：凭据已经在内存里能用了，说一声「下次启动还得重扫」
-/// 就够了，不能反过来告诉用户「登录失败」让他白扫一次。
-async fn apply_login(
+/// 打成包（跟 `Wiring` / `ObsFill` 一个理由）：凭据一变，这个任务要同时通知
+/// 弹幕那条链路、房间信息那条，还得能跟扫码那条说上话 —— 一个个摆出来就是八个参数，
+/// 调用方和这里得永远保持同一个顺序，改一个就得两头对一遍。
+struct CredentialPaths {
+    /// 登录任务 -> 这里：拼好的 Cookie 串
+    creds: mpsc::Receiver<String>,
+    /// 界面 -> 这里：退出登录
+    logout: mpsc::Receiver<()>,
+    /// 这里 -> 登录任务：退完顺手再要一张码
+    login_start: mpsc::Sender<()>,
+    /// 这里 -> 弹幕那条链路：凭据变了，整条重来
+    auth: watch::Sender<u64>,
+    /// 这里 -> 房间信息那条：立刻重拉一次
+    refresh: mpsc::Sender<()>,
+}
+
+/// 凭据变了之后要落地的那一串事。**扫码登录和退出登录都从这儿走**。
+///
+/// 两件事的落点一模一样：内存里的 client、磁盘上的 config.toml、弹幕那条链路。
+/// 分成两个任务写就会各自漏一处 —— 比如退出时忘了重启弹幕，现象是
+/// 「界面说退了，弹幕还挂着旧身份在跑」，最难查的一种。
+///
+/// 落盘失败**不算登录 / 退出失败**：内存里那套已经生效了，说一声
+/// 「下次启动还得重扫 / 配置里没清干净」就够了，不能反过来告诉用户操作失败。
+async fn session_task(
     client: Arc<BiliClient>,
     cfg_path: PathBuf,
-    mut creds: mpsc::Receiver<String>,
-    auth: watch::Sender<u64>,
-    refresh: mpsc::Sender<()>,
+    paths: CredentialPaths,
     evt: mpsc::Sender<LoginEvent>,
 ) {
-    while let Some(cookie) = creds.recv().await {
-        client.set_cookie(&cookie).await;
-
-        // 重新读一遍再写：只覆盖 cookie 那一行，别把用户（或者在别处）改过的
-        // 房间号、单行显示这些冲掉。
-        let saved = config::Config::load_or_create(Some(&cfg_path)).and_then(|mut cfg| {
-            cfg.cookie = cookie.clone();
-            cfg.save_to(&cfg_path)
-        });
-        let note = match saved {
-            Ok(()) => String::new(),
-            Err(e) => format!("（Cookie 没能写进配置：{e}）"),
-        };
-
-        // 房间信息那条是「每轮现读 cookie」的循环，不用重启，但得补一次手刷，
-        // 不然要等满 30 秒才轮到新凭据。
-        api::room::refresh(&refresh);
-        // 弹幕那条得整条重来（见 `supervise_danmaku`）。
-        auth.send_replace(auth.borrow().wrapping_add(1));
-
-        // nav 的缓存被 `set_cookie` 清过了，这里会拿新凭据重新问一次。
-        let line = match client.nav().await {
-            Ok(n) if n.is_login => format!("{} (uid {})", n.uname, n.mid),
-            Ok(_) => "已登录（账号信息还没出来，回账号栏再按一次回车）".to_string(),
-            Err(e) => format!("已登录，但取账号信息失败：{e}"),
-        };
-        if evt.send(LoginEvent::LoggedIn(line)).await.is_err() {
-            return; // 界面没了
+    let CredentialPaths {
+        mut creds,
+        mut logout,
+        login_start,
+        auth,
+        refresh,
+    } = paths;
+    loop {
+        tokio::select! {
+            Some(cookie) = creds.recv() => {
+                apply_login(&client, &cfg_path, cookie, &auth, &refresh, &evt).await;
+                // 界面没了（`evt.send` 失败）就收工，别再管下一条。
+                if evt.is_closed() {
+                    return;
+                }
+            }
+            Some(()) = logout.recv() => {
+                apply_logout(&client, &cfg_path, &login_start, &auth, &refresh, &evt).await;
+                if evt.is_closed() {
+                    return;
+                }
+            }
+            // 两条通道都没了 = 界面没了，收工
+            else => return,
         }
-        let _ = evt
-            .send(LoginEvent::Hint(format!(
-                "登录成功，弹幕已用新凭据重连{note}"
-            )))
-            .await;
     }
+}
+
+/// 扫码成功后把新凭据落到三个地方：内存里的 client、磁盘上的 config.toml、
+/// 以及两条正在跑的网络链路。
+async fn apply_login(
+    client: &BiliClient,
+    cfg_path: &Path,
+    cookie: String,
+    auth: &watch::Sender<u64>,
+    refresh: &mpsc::Sender<()>,
+    evt: &mpsc::Sender<LoginEvent>,
+) {
+    client.set_cookie(&cookie).await;
+
+    // 重新读一遍再写：只覆盖 cookie 那一行，别把用户（或者在别处）改过的
+    // 房间号、单行显示这些冲掉。
+    let saved = config::Config::load_or_create(Some(cfg_path)).and_then(|mut cfg| {
+        cfg.cookie = cookie.clone();
+        cfg.save_to(cfg_path)
+    });
+    let note = match saved {
+        Ok(()) => String::new(),
+        Err(e) => format!("（Cookie 没能写进配置：{e}）"),
+    };
+
+    // 房间信息那条是「每轮现读 cookie」的循环，不用重启，但得补一次手刷，
+    // 不然要等满 30 秒才轮到新凭据。
+    api::room::refresh(refresh);
+    // 弹幕那条得整条重来（见 `supervise_danmaku`）。
+    signal_credential_change(auth);
+
+    // nav 的缓存被 `set_cookie` 清过了，这里会拿新凭据重新问一次。
+    let line = match client.nav().await {
+        Ok(n) if n.is_login => format!("{} (uid {})", n.uname, n.mid),
+        Ok(_) => "已登录（账号信息还没出来，回账号栏再按一次回车）".to_string(),
+        Err(e) => format!("已登录，但取账号信息失败：{e}"),
+    };
+    if evt.send(LoginEvent::LoggedIn(line)).await.is_err() {
+        return; // 界面没了
+    }
+    let _ = evt
+        .send(LoginEvent::Hint(format!(
+            "登录成功，弹幕已用新凭据重连{note}"
+        )))
+        .await;
+}
+
+/// 退出登录：把本地凭据清掉，并把弹幕那条链路整条重启。
+///
+/// 四件事按顺序：**内存里的凭据** -> **配置里那一行** -> **两条网络链路** ->
+/// **界面**。房间信息那条不用重启（它每轮现读 cookie），补一次手刷就行。
+///
+/// 特别说明：清掉之后这一场的弹幕会断到重新扫码为止 —— 这正是确认层那句文案
+/// 要跟用户说清楚的事，所以这里不能「悄悄清、悄悄不断」。
+async fn apply_logout(
+    client: &BiliClient,
+    cfg_path: &Path,
+    login_start: &mpsc::Sender<()>,
+    auth: &watch::Sender<u64>,
+    refresh: &mpsc::Sender<()>,
+    evt: &mpsc::Sender<LoginEvent>,
+) {
+    // 1. 内存里那套凭据（连带 nav 缓存）先清掉：之后所有请求都是匿名的。
+    //    client 是 Arc 共享的，清的是里面那块 `Mutex<Auth>` ——
+    //    弹幕 / 房间 / 发送三条链路都跟着变。
+    client.set_cookie("").await;
+
+    // 2. 磁盘上**只清 cookie 那一行**（先重读再写，见 `Config::clear_cookie`）：
+    //    房间号 / 分区 / obs_* 都得原样留着。
+    let note = match config::Config::clear_cookie(cfg_path) {
+        Ok(()) => String::new(),
+        Err(e) => format!("（配置里的 Cookie 没能清掉：{e}）"),
+    };
+
+    // 3. 两条网络链路。房间信息补一次手刷；弹幕那条整条重来 ——
+    //    理由跟登录时一样：wss 的认证包在握手时就发完了，没有「换个身份」这一步。
+    api::room::refresh(refresh);
+    signal_credential_change(auth);
+
+    // 4. 界面：账号那行回到「未登录（回车扫码）」。
+    if evt
+        .send(LoginEvent::LoggedOut("未登录（回车扫码）".into()))
+        .await
+        .is_err()
+    {
+        return; // 界面没了
+    }
+    // 顺手替用户要一张新码（跟账号栏那个「重新扫码」走同一条信号），
+    // 别让他退出完还得到处找键。扫码任务正忙的时候这一下会被丢掉 —— 也不要紧，
+    // 界面上「重新扫码」还在，退出的结果已经落地了。
+    let _ = login_start.try_send(());
+    let _ = evt
+        .send(LoginEvent::Hint(format!(
+            "已退出登录，弹幕已断开；正在生成新的二维码{note}"
+        )))
+        .await;
 }
 
 #[cfg(test)]
@@ -959,6 +1087,94 @@ mod tests {
         );
         assert_eq!(after.room_id, 6, "别把房间号冲掉");
 
+        task.abort();
+        let _ = std::fs::remove_file(&cfg_path);
+    }
+
+    /// 退出登录那条链打一遍（离线，全在假通道 + 临时配置上）：
+    /// 内存里的凭据清掉、配置里**只**清 cookie、弹幕那条链路收到重启信号、
+    /// 房间信息补一次手刷、界面收到「未登录」和一句说明，还顺手要了一张新码。
+    ///
+    /// **绝不能拿 tc191 真在用的那份配置跑这个** —— 那会把他现在能用的登录态作废。
+    /// 这里用的一律是临时路径。
+    #[tokio::test]
+    async fn session_task_logout_clears_everything_and_restarts_the_chain() {
+        let dir = std::env::temp_dir().join(format!("bililive-logout-task-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg_path = dir.join("config.toml");
+        config::Config {
+            cookie: "SESSDATA=abc; bili_jct=def; DedeUserID=7".into(),
+            room_id: 6,
+            area_id: 371,
+            area_name: "虚拟主播/虚拟日常".into(),
+            obs_host: "127.0.0.1".into(),
+            obs_port: 4455,
+            ..config::Config::default()
+        }
+        .save_to(&cfg_path)
+        .unwrap();
+
+        // 退出这条路一个网络请求都不该发，所以这条 client 的 base 随便 ——
+        // 真发了请求，`nav()` 那个默认地址会直接超时，测试当场就挂。
+        let client = Arc::new(BiliClient::new("SESSDATA=abc; bili_jct=def").unwrap());
+        let (creds_tx, creds_rx) = mpsc::channel::<String>(1);
+        let (logout_tx, logout_rx) = mpsc::channel::<()>(1);
+        let (login_tx, mut login_rx) = mpsc::channel::<()>(1);
+        let (auth_tx, mut auth_rx) = watch::channel(0u64);
+        let (refresh_tx, mut refresh_rx) = mpsc::channel::<()>(1);
+        let (evt_tx, mut evt_rx) = mpsc::channel::<LoginEvent>(8);
+        let task = tokio::spawn(session_task(
+            client.clone(),
+            cfg_path.clone(),
+            CredentialPaths {
+                creds: creds_rx,
+                logout: logout_rx,
+                login_start: login_tx,
+                auth: auth_tx,
+                refresh: refresh_tx,
+            },
+            evt_tx,
+        ));
+
+        assert!(client.logged_in().await, "开局手上是有凭据的");
+        logout_tx.send(()).await.unwrap();
+
+        // 界面：先「未登录」，再一句说清楚弹幕断了、正在出码
+        let LoginEvent::LoggedOut(line) = evt_rx.recv().await.unwrap() else {
+            panic!("第一条该是「未登录」")
+        };
+        assert!(line.contains("未登录"), "{line}");
+        let LoginEvent::Hint(note) = evt_rx.recv().await.unwrap() else {
+            panic!("第二条该是一句说明")
+        };
+        assert!(note.contains("退出登录"), "{note}");
+        assert!(note.contains("弹幕已断开"), "{note}");
+
+        // 内存里的凭据确实空了
+        assert!(!client.logged_in().await, "退出之后内存里不该还有凭据");
+        assert!(client.csrf().await.is_none());
+
+        // 配置里**只有 cookie** 被清掉，别的字段逐字节还在
+        let after = config::Config::load_or_create(Some(&cfg_path)).unwrap();
+        assert_eq!(after.cookie, "");
+        assert_eq!(after.room_id, 6, "房间号不许被冲掉");
+        assert_eq!(after.area_id, 371, "刚选的分区不许被冲掉");
+        assert_eq!(after.area_name, "虚拟主播/虚拟日常");
+        assert_eq!(after.obs_host, "127.0.0.1", "OBS 那些也不许被冲掉");
+        assert_eq!(after.obs_port, 4455);
+
+        // 弹幕那条链路收到「整条重来」的信号（watch 的计数变了）
+        tokio::time::timeout(Duration::from_secs(1), auth_rx.changed())
+            .await
+            .expect("退出登录之后弹幕那条链路得收到重启信号")
+            .expect("watch 发送端还活着");
+        // 房间信息那条不用重启，但得补一次手刷
+        assert!(refresh_rx.try_recv().is_ok(), "房间信息该被补刷一次");
+        // 顺手要了一张新二维码
+        assert!(login_rx.try_recv().is_ok(), "退完就该去要一张新码");
+
+        drop(creds_tx);
+        drop(logout_tx);
         task.abort();
         let _ = std::fs::remove_file(&cfg_path);
     }
