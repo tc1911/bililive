@@ -37,6 +37,21 @@ cargo run                # 跑 TUI（Ctrl+R 手动刷房间信息，Ctrl+C 退�
 配置在 `~/.config/bililive/config.toml`（跟 Go 版的 `~/.config/bili/config.toml` 是两个文件）。
 第一次跑会生成一份默认的。crates 走 rsproxy 镜像，**不要改** `~/.cargo/config.toml`。
 
+## 打包与发版
+
+配方是仓库根的 `PKGBUILD`（源码包，`source` 走 `git+ssh` 拉本仓的 `v<pkgver>` tag）；
+软件源 `~/项目/tc191-pkgs/bililive/` 里另有一份同样的副本，包打进 `~/vtb/归档/bililive/`。
+`pkgver` 跟 `Cargo.toml` 的 `version` 必须一起改。
+
+```bash
+# 1. 改 Cargo.toml 的 version → 提交
+# 2. 打 tag 推上去（这一步要 tc191 点头，见「别做的事」）
+git tag v0.1.0 && git push origin main v0.1.0
+# 3. 打包 → 4. 发源
+bash ~/项目/tc191-pkgs/bililive/make_bililive_pkg.sh
+bash ~/项目/tc191-pkgs/scripts/publish_pages.sh
+```
+
 ## 两页的按键分工（照 Go 版，别串）
 
 | 键 | 弹幕页（第一页） | 配置页（第二页） |
@@ -1671,7 +1686,9 @@ Shift+Tab      -> 账号栏：▸ 重新扫码 / 退出登录 都在，▸ 在�
 
 ## 别做的事
 
-- 不要 `git push`；不要动 `../bilibili_live_tui+`（那里是行为参照物）
+- 不要 `git push`（**唯一例外**：发版那一下 —— 打包要从 tag 拉源码，tag 不在
+  GitHub 上就拉不到，所以推提交 + tag 要先问 tc191）；不要动 `../bilibili_live_tui+`
+  （那里是行为参照物）
 - 不要把 Cookie 写进日志或打印出来；`config.toml` 永远不进 git
 - 不要在没验证的情况下改 `wbi.rs` 的置换表 / `!'()*` 过滤 / `client.rs` 的请求头
 - 不要在 `ui/` 里直接发请求，也不要在 `api/` 里画东西
