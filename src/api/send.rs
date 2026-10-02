@@ -73,8 +73,10 @@ pub async fn send_one(
     // 用户至少知道该去配置里补什么。
     let csrf = client
         .csrf()
-        .context("Cookie 里没有 bili_jct（发弹幕拿它当 csrf），把登录后的完整 Cookie 补进 config.toml")?
-        .to_string();
+        .await
+        .context(
+            "Cookie 里没有 bili_jct（发弹幕拿它当 csrf），把登录后的完整 Cookie 补进 config.toml",
+        )?;
 
     let query = wbi::sign(&[("web_location", WEB_LOCATION.to_string())], mixin_key, wts);
     let url = format!("{base}{SEND_PATH}?{query}");

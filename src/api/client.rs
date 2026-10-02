@@ -49,8 +49,36 @@ const NAV_TTL: Duration = Duration::from_secs(30 * 60);
 pub struct Nav {
     /// 登录 uid；没登录时是 0，发弹幕认证包时照发 0。
     pub mid: i64,
+    /// 昵称。账号栏那行「名字 (uid N)」要它，不登录时是空串。
+    pub uname: String,
+    /// 服务端说这次是不是登录着的（`data.isLogin`）。
+    ///
+    /// 光看 mid 不够：有的接口没登录也回一个非 0 的 mid（设备 id 之类）。
+    pub is_login: bool,
     pub mixin_key: String,
     at: Instant,
+}
+
+/// 手上这套凭据。登录成功后要能把新的换进来 —— 客户端是 `Arc` 共享给
+/// 好几条链路的（弹幕 / 房间 / 发送），整只换掉做不到，只能让里面这块可变。
+#[derive(Debug, Clone, Default)]
+struct Auth {
+    /// 预先校验过的 Cookie 头值，见 `sanitize_cookie`
+    header: Option<HeaderValue>,
+    /// 原样的 Cookie 串。判断 `SESSDATA` 在不在只看它，别去解 header。
+    raw: String,
+    /// Cookie 里的 `bili_jct`
+    csrf: Option<String>,
+}
+
+impl Auth {
+    fn from_cookie(raw: &str) -> Self {
+        Self {
+            header: sanitize_cookie(raw),
+            raw: raw.to_string(),
+            csrf: cookie_value(raw, "bili_jct"),
+        }
+    }
 }
 
 pub struct BiliClient {
@@ -61,10 +89,7 @@ pub struct BiliClient {
     /// 就是一句中文。直接把这种东西交给 `reqwest` 的 `.header()` 会 **panic**，
     /// 而 TUI 一 panic 就是整屏消失、用户什么都看不到。所以这里先过滤 + 校验，
     /// 不合法就干脆不带 Cookie（退化成未登录，报错也只是几行系统弹幕）。
-    cookie: Option<HeaderValue>,
-    /// Cookie 里的 `bili_jct`。发弹幕要把它同时填进表单的 `csrf` 和 `csrf_token`，
-    /// 接口只认这个，别去别处找（`SESSDATA` 是身份，`bili_jct` 才是防 CSRF 的令牌）。
-    csrf: Option<String>,
+    auth: tokio::sync::Mutex<Auth>,
     /// 主站（`api.bilibili.com`）的 base，nav 走它。
     ///
     /// 做成字段纯粹是为了测试：假服务器只能顶掉一个 base，
@@ -81,8 +106,7 @@ impl BiliClient {
             .build()?;
         Ok(Self {
             http,
-            cookie: sanitize_cookie(cookie),
-            csrf: cookie_value(cookie, "bili_jct"),
+            auth: Mutex::new(Auth::from_cookie(cookie)),
             main_base: MAIN_BASE.to_string(),
             nav: Mutex::new(None),
         })
@@ -97,8 +121,27 @@ impl BiliClient {
 
     /// 登录令牌。没登录（或配置里那串 Cookie 不全）时是 `None`，
     /// 发送端据此在**发请求之前**就说清楚缺什么，而不是等一个含糊的 `-101`。
-    pub fn csrf(&self) -> Option<&str> {
-        self.csrf.as_deref()
+    ///
+    /// 取出来的是拷贝而不是引用：登录成功后 cookie 会换，引用会指到旧的。
+    pub async fn csrf(&self) -> Option<String> {
+        self.auth.lock().await.csrf.clone()
+    }
+
+    /// 配置里那套凭据**看起来**齐不齐（`SESSDATA` + `bili_jct` 都在）。
+    /// 真灵不灵验交给 `nav` 判断 —— 跟 Go 版一样分两步，不然每次启动都要多打一次接口。
+    pub async fn logged_in(&self) -> bool {
+        let auth = self.auth.lock().await;
+        cookie_value(&auth.raw, "SESSDATA").is_some() && auth.csrf.is_some()
+    }
+
+    /// 换上一套新凭据（扫码登录成功之后）。
+    ///
+    /// 顺手把 nav 缓存清掉：那份缓存里带着上一个身份的 uid 和 WBI 种子，
+    /// 不清的话下一次 nav 会直接命中缓存，界面上还是旧账号，
+    /// 弹幕认证包里那个 uid 也一直是旧的。
+    pub async fn set_cookie(&self, raw: &str) {
+        *self.auth.lock().await = Auth::from_cookie(raw);
+        *self.nav.lock().await = None;
     }
 
     /// 发一次 GET，返回**整个**响应体（不判 code）。
@@ -106,26 +149,44 @@ impl BiliClient {
     /// 有的接口 `code != 0` 也照样给数据 —— nav 没登录时返 `-101`，但 `wbi_img` 是齐的，
     /// 拿它当失败就永远签不了名。
     pub async fn get_value(&self, url: &str) -> Result<Value> {
+        Ok(self.get_json_and_cookies(url).await?.0)
+    }
+
+    /// 发一次 GET，把 JSON 和响应里的 `Set-Cookie` **一起**带回来。
+    ///
+    /// 扫码登录的凭据就藏在 `Set-Cookie` 里，`get_value` 只看 body 会把它整个丢掉。
+    /// 也别指望 reqwest 的 cookie_store：那跟我们自己管的那条 Cookie 头是两套账，
+    /// 两边都会往请求里塞，风控看到两份 `SESSDATA` 只会更可疑。
+    pub async fn get_json_and_cookies(&self, url: &str) -> Result<(Value, Vec<String>)> {
         let mut req = self.http.get(url);
-        if let Some(cookie) = &self.cookie {
-            req = req.header(reqwest::header::COOKIE, cookie.clone());
+        if let Some(cookie) = self.auth.lock().await.header.clone() {
+            req = req.header(reqwest::header::COOKIE, cookie);
         }
         let resp = req
             .send()
             .await
             .map_err(|e| anyhow!("请求 {} 失败: {e}", short(url)))?;
         let status = resp.status();
+        // 头得在 `text()` 之前收走 —— 那个方法会把整个响应吃掉。
+        let cookies: Vec<String> = resp
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(str::to_string)
+            .collect();
         let text = resp
             .text()
             .await
             .map_err(|e| anyhow!("读 {} 的响应失败: {e}", short(url)))?;
-        serde_json::from_str(&text).map_err(|_| {
+        let v = serde_json::from_str(&text).map_err(|_| {
             anyhow!(
                 "{} 返回的不是 JSON (HTTP {status}): {}",
                 short(url),
                 truncate(&text, 200)
             )
-        })
+        })?;
+        Ok((v, cookies))
     }
 
     /// 发一次 GET 并拆掉 `{code,message,data}` 外壳，`code != 0` 一律转成错误。
@@ -161,8 +222,8 @@ impl BiliClient {
                 "application/x-www-form-urlencoded; charset=UTF-8",
             )
             .body(body);
-        if let Some(cookie) = &self.cookie {
-            req = req.header(reqwest::header::COOKIE, cookie.clone());
+        if let Some(cookie) = self.auth.lock().await.header.clone() {
+            req = req.header(reqwest::header::COOKIE, cookie);
         }
         let resp = req
             .send()
@@ -210,6 +271,8 @@ impl BiliClient {
 
         let nav = Nav {
             mid: int_of(&body["data"]["mid"]),
+            uname: str_of(&body["data"]["uname"]),
+            is_login: body["data"]["isLogin"].as_bool().unwrap_or(false),
             mixin_key: wbi::mixin_key(&wbi::key_from_url(img), &wbi::key_from_url(sub)),
             at: Instant::now(),
         };
@@ -313,16 +376,57 @@ mod tests {
 
     /// 发弹幕的 csrf 只能来自 cookie 里的 bili_jct：取不到就得当场说「没登录」，
     /// 不能拿空串去发（服务端只会回一句含糊的 -111）。
-    #[test]
-    fn csrf_comes_from_bili_jct() {
+    #[tokio::test]
+    async fn csrf_comes_from_bili_jct() {
         let c = BiliClient::new("SESSDATA=abc; bili_jct=tok123; DedeUserID=7").unwrap();
-        assert_eq!(c.csrf(), Some("tok123"));
+        assert_eq!(c.csrf().await.as_deref(), Some("tok123"));
 
         // 名字对不上 / 没有这个键 / 值是空的，一律算没登录
-        assert!(BiliClient::new("SESSDATA=abc").unwrap().csrf().is_none());
-        assert!(BiliClient::new("bili_jct2=nope").unwrap().csrf().is_none());
-        assert!(BiliClient::new("bili_jct=").unwrap().csrf().is_none());
-        assert!(BiliClient::new("").unwrap().csrf().is_none());
+        assert!(BiliClient::new("SESSDATA=abc").unwrap().csrf().await.is_none());
+        assert!(BiliClient::new("bili_jct2=nope").unwrap().csrf().await.is_none());
+        assert!(BiliClient::new("bili_jct=").unwrap().csrf().await.is_none());
+        assert!(BiliClient::new("").unwrap().csrf().await.is_none());
+    }
+
+    /// 登录成功后要能换掉手上的凭据：client 被好几条链路 Arc 共享着，整只换不了。
+    /// 换完 nav 缓存也得跟着失效，不然下次 nav 直接命中旧账号的缓存。
+    #[tokio::test]
+    async fn set_cookie_swaps_credentials_and_drops_the_nav_cache() {
+        // 第一次问（还没登录）回 isLogin:false，之后回真账号 ——
+        // 这样「缓存被清掉、真的重新问了一次」才验得出来。
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = calls.clone();
+        let srv = test_http::start(move |_| {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = format!(
+                r#"{{"code":0,"message":"0","data":{{"mid":{},"isLogin":{},"uname":"{}",
+                    "wbi_img":{{"img_url":"https://i0.hdslb.com/bfs/wbi/7cd084941338484aae1ad9425b84077c.png",
+                               "sub_url":"https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png"}}}}}}"#,
+                if n == 0 { 0 } else { 7 },
+                n != 0,
+                if n == 0 { "" } else { "小明" },
+            );
+            (200, body)
+        })
+        .await;
+
+        let c = BiliClient::new("").unwrap().with_main_base(&srv.base);
+        assert!(!c.logged_in().await, "空 Cookie 不算登录");
+        assert!(c.csrf().await.is_none());
+
+        // 先让 nav 缓存里存一份「没登录」的结果
+        assert!(!c.nav().await.unwrap().is_login);
+
+        c.set_cookie("SESSDATA=s; bili_jct=tok; DedeUserID=7").await;
+        assert!(c.logged_in().await);
+        assert_eq!(c.csrf().await.as_deref(), Some("tok"));
+
+        // 缓存没被清掉的话这里会拿到上面那份「没登录」，界面上就还是旧账号
+        let nav = c.nav().await.unwrap();
+        assert!(nav.is_login);
+        assert_eq!(nav.uname, "小明");
+        assert_eq!(nav.mid, 7);
+        assert_eq!(srv.hits().len(), 2, "换凭据之后 nav 该重新问一次");
     }
 
     /// 值里混进换行时要清掉：它会被拼进请求体，带 `\r` 发出去服务端认不出来。

@@ -4,6 +4,9 @@
 //! 顺便把网络那边塞进 channel 的消息取走、重画一帧。TUI 这点开销无所谓，
 //! 而 tokio 是多线程运行时，主线程堵这 100ms 不影响后台的网络任务。
 
+mod control;
+mod qr;
+
 use std::collections::VecDeque;
 
 use anyhow::Result;
@@ -19,9 +22,11 @@ use std::time::Duration;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::api::danmaku::DanmuMsg;
+use crate::api::login::LoginEvent;
 use crate::api::room::{self, OnlineRankUser, RoomInfo};
 use crate::config::Config;
 use crate::timefmt;
+use control::{Action, Control};
 
 /// 软件名的艺术字（figlet 的 ANSI Shadow，手抄的）。每行都是 50 格宽、共 6 行。
 pub const BANNER: [&str; 6] = [
@@ -45,15 +50,27 @@ const HISTORY_MAX: usize = 10;
 
 pub async fn run(
     cfg: Config,
-    danmu_rx: Receiver<DanmuMsg>,
-    room_rx: Receiver<RoomInfo>,
-    refresh_tx: Sender<()>,
-    send_tx: Sender<String>,
+    w: Wiring,
 ) -> Result<()> {
     let mut terminal = setup()?;
-    let res = event_loop(&mut terminal, cfg, danmu_rx, room_rx, refresh_tx, send_tx).await;
+    let res = event_loop(&mut terminal, cfg, w).await;
     restore()?;
     res
+}
+
+/// 界面跟外面那几条链路之间的通道。
+///
+/// 打成包只因为 `run` 的参数已经七八个了 —— 一个个摆出来，调用方（main）
+/// 和这里就得永远保持同一个顺序，改一个就得两头对一遍，迟早对错。
+pub struct Wiring {
+    pub danmaku: Receiver<DanmuMsg>,
+    pub room: Receiver<RoomInfo>,
+    pub refresh: Sender<()>,
+    pub send: Sender<String>,
+    /// 界面 -> 登录任务：开一张新二维码
+    pub login_start: Sender<()>,
+    /// 登录任务 -> 界面
+    pub login_events: Receiver<LoginEvent>,
 }
 
 fn setup() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
@@ -78,6 +95,8 @@ struct App {
     /// 多行模式下上一次发言的人/类型/分钟，用来决定要不要重打一遍名字
     last_group: Option<(String, String, String)>,
     input: Input,
+    /// 第二页（配置页）的状态。网络那半边从不碰它 —— 它只吃 `LoginEvent`。
+    control: Control,
 }
 
 /// 底部那个输入框。
@@ -282,11 +301,16 @@ fn content_color(kind: &str) -> Color {
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     cfg: Config,
-    mut danmu_rx: Receiver<DanmuMsg>,
-    mut room_rx: Receiver<RoomInfo>,
-    refresh_tx: Sender<()>,
-    send_tx: Sender<String>,
+    w: Wiring,
 ) -> Result<()> {
+    let Wiring {
+        danmaku: mut danmu_rx,
+        room: mut room_rx,
+        refresh: refresh_tx,
+        send: send_tx,
+        login_start,
+        login_events: mut login_rx,
+    } = w;
     let mut app = App::default();
     loop {
         // 先收网络那边的消息再画，画面永远是最新的。
@@ -294,7 +318,13 @@ async fn event_loop(
             app.push_danmu(&m, &cfg);
         }
         while let Ok(r) = room_rx.try_recv() {
+            // 顺手把标题喂给配置页的「直播间信息」栏，省得那一栏空着让人以为坏了 ——
+            // 这轮它自己不发请求（真去改标题是下一步）。
+            app.control.seed_title(&r.title);
             app.room = Some(r);
+        }
+        while let Ok(ev) = login_rx.try_recv() {
+            app.control.on_login_event(ev);
         }
 
         terminal.draw(|f| draw(f, &app, &cfg))?;
@@ -306,29 +336,51 @@ async fn event_loop(
         {
             match (code, modifiers) {
                 // 退出只有 Ctrl+C：Esc 是「返回上一层」，别接成退出。
+                // 它排在最前面，所以输入框和配置页都抢不走。
                 (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(()),
                 // 手动刷房间信息（跟 Go 版的 Ctrl+R 一致），不等那 30 秒。
-                (KeyCode::Char('r'), KeyModifiers::CONTROL) => room::refresh(&refresh_tx),
-                // 剩下的都归输入框。这两个全局键排在最前面，所以正在打字时
-                // Ctrl+C 照样退出、Ctrl+R 照样刷新，不会被输入框吃掉。
-                _ => {
-                    if let Some(text) = app.input.handle_key(code, modifiers)
-                        && send_tx.try_send(text.clone()).is_err()
-                    {
-                        // 队列满、或者发送端没起来（比如没配房间号）。界面永远不等发送端，
-                        // 但这条得说清楚没发出去，不然用户对着空气等回显。
-                        app.push_danmu(
-                            &DanmuMsg::system(format!("这条没发出去（发送端没起来）：{text}")),
-                            &cfg,
-                        );
-                    }
+                // 配置页上按也行 —— Go 版就是全局 capture，两页共用一套。
+                (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                    room::refresh(&refresh_tx);
+                    app.control.set_message("已请求刷新房间信息");
                 }
+                // 剩下的先问配置页：Shift+Tab / Tab / Esc / F2… 都归它分派。
+                // 它说「这一下归我」就到此为止，说「交给主页面」才轮到输入框 ——
+                // 所以弹幕页上按 Tab 还是输入框的键，抢不走。
+                _ => match app.control.handle_key(code, modifiers) {
+                    Action::Handled => {}
+                    Action::StartLogin => {
+                        if login_start.try_send(()).is_err() {
+                            // 队列只有一格：扫码任务正忙的时候再按就丢。
+                            // 说一句，比让用户对着一个没反应的键连按强。
+                            app.control.set_message("扫码任务正忙，等它一下再看看");
+                        }
+                    }
+                    Action::ToMain => {
+                        if let Some(text) = app.input.handle_key(code, modifiers)
+                            && send_tx.try_send(text.clone()).is_err()
+                        {
+                            // 队列满、或者发送端没起来（比如没配房间号）。界面永远不等
+                            // 发送端，但这条得说清楚没发出去，不然用户对着空气等回显。
+                            app.push_danmu(
+                                &DanmuMsg::system(format!("这条没发出去（发送端没起来）：{text}")),
+                                &cfg,
+                            );
+                        }
+                    }
+                },
             }
         }
     }
 }
 
 fn draw(f: &mut Frame, app: &App, _cfg: &Config) {
+    // 第二页占满整屏：主页面那套一格里都不留（Go 版是 Pages 切换，一个意思）。
+    if app.control.page() == control::Page::Config {
+        control::draw(f, &app.control, f.area());
+        return;
+    }
+
     let area = f.area();
     let [header, body, footer] = Layout::vertical([
         Constraint::Length(HEADER_ROWS),
@@ -954,5 +1006,135 @@ mod tests {
             "sub_url":"https://i0.hdslb.com/bfs/wbi/4932caff0ff746eab6f01bf08b70ac45.png"}}}"#
             .to_string()
     }
+
+    // ------------------------------------------------------------ 配置页（第二页）
+
+    /// Shift+Tab 翻开第二页之后，整屏都是配置页：左栏四个功能、
+    /// 顶栏「按键提示」+ 那一栏的按键、右栏标题是当前栏的名字。
+    /// 主页面那几块（艺术字、弹幕、输入框）一个字都不该剩。
+    #[test]
+    fn config_page_takes_over_the_whole_screen() {
+        let cfg = Config::default();
+        let mut app = App::default();
+        app.push_danmu(&danmu("小明".into(), "你好".into()), &cfg);
+        app.room = Some(RoomInfo::new(9527));
+
+        assert_eq!(
+            app.control.handle_key(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Action::StartLogin,
+            "没登录：翻开账号栏顺手就要一张二维码"
+        );
+
+        let out = render(&app, &cfg, 120, 30);
+        for want in [
+            "按键提示",
+            "功能",
+            "账号",
+            "分区",
+            "直播间信息",
+            "推流码",
+            "回车 重新扫码",
+            "未登录（回车扫码）",
+        ] {
+            assert!(
+                flat(&out).contains(&flat(want)),
+                "配置页上缺了「{want}」：\n{out}"
+            );
+        }
+        assert!(!flat(&out).contains("弹幕们"), "主页面不该还在：\n{out}");
+        assert!(!flat(&out).contains("在这里打字"), "输入框也不该还在：\n{out}");
+        assert!(!out.contains(BANNER[0]), "艺术字是主页面的，配置页上不该有");
+    }
+
+    /// 左栏 16 格宽、当前项前面是 ▸、右栏的边框标题跟着当前栏走。
+    #[test]
+    fn sidebar_and_content_frame_follow_the_current_tab() {
+        let cfg = Config::default();
+        let mut app = App::default();
+        // 先假装登录过：换栏本身不该翻出二维码来干扰这一屏
+        app.control
+            .on_login_event(LoginEvent::LoggedIn("小明 (uid 7)".into()));
+        app.control.handle_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+
+        let out = render(&app, &cfg, 120, 30);
+        let rows: Vec<&str> = out.lines().collect();
+        // 四个功能名都落在左栏那 16 格里（右栏、顶栏里出现的不算数）
+        for name in ["账号", "分区", "直播间信息", "推流码"] {
+            assert!(
+                rows.iter()
+                    .any(|l| flat(&first_cells(l, 16)).contains(&flat(name))),
+                "「{name}」不在左栏里：\n{out}"
+            );
+        }
+        // 当前项前面是 ▸，而且只有一项带它
+        let marked = mark_row(&rows);
+        assert!(flat(marked).contains("▸账号"));
+        // 右栏那条边框的标题就是当前栏的名字，写在正文第一行上。
+        // 认它靠「这一行有两条框的顶边」（顶栏只有一条）。
+        let top = body_top(&rows);
+        assert!(flat(top).contains("账号"), "{top}");
+
+        // Tab 换到分区栏：▸ 和右栏标题都要跟着走
+        app.control.handle_key(KeyCode::Tab, KeyModifiers::NONE);
+        let out = render(&app, &cfg, 120, 30);
+        let rows: Vec<&str> = out.lines().collect();
+        let marked = mark_row(&rows);
+        assert!(flat(marked).contains("▸分区"));
+        let top = body_top(&rows);
+        assert!(flat(top).contains("分区"), "{top}");
+        assert!(!flat(top).contains("账号"), "标题得跟着换：{top}");
+    }
+
+    /// 正文第一行：左栏和右栏两条框的顶边都在这上面。
+    fn body_top<'a>(rows: &[&'a str]) -> &'a str {
+        rows.iter()
+            .find(|l| l.matches('┌').count() >= 2)
+            .expect("正文第一行有两条框的顶边")
+    }
+
+    /// 找到带 ▸ 的那一行，并确认全屏只有这一行有 ——
+    /// 两个 ▸ 的话用户根本不知道选的是谁。
+    fn mark_row<'a>(rows: &[&'a str]) -> &'a str {
+        let marked: Vec<&&str> = rows.iter().filter(|l| l.contains('▸')).collect();
+        assert_eq!(marked.len(), 1, "▸ 只该出现在当前那一项上：\n{rows:?}");
+        marked[0]
+    }
+
+    /// 取一行里前 `n` 格。缓冲区里一格正好一个字符（宽字符的第二格是空格），
+    /// 所以直接按字符切就是按格切 —— 别用上面的 `cell_text`，
+    /// 那个是按显示宽度累加的，碰上汉字会把预算算多。
+    fn first_cells(line: &str, n: usize) -> String {
+        line.chars().take(n).collect()
+    }
+
+    /// 账号栏拿到二维码内容就画出来（半格字符），登录成功之后收掉。
+    #[test]
+    fn account_pane_draws_the_qr_and_drops_it_after_login() {
+        let cfg = Config::default();
+        let mut app = App::default();
+        app.control.handle_key(KeyCode::BackTab, KeyModifiers::SHIFT);
+        app.control.on_login_event(LoginEvent::Qr(
+            "https://passport.bilibili.com/h5/login?qrcode_key=abcdefgh".into(),
+        ));
+
+        // 二维码有 40 来行，终端得给够高度
+        let out = render(&app, &cfg, 120, 48);
+        assert!(
+            out.contains('▀') || out.contains('█') || out.contains('▄'),
+            "二维码没画出来：\n{out}"
+        );
+        assert!(flat(&out).contains(&flat("用哔哩哔哩 App 扫码登录")));
+        assert!(flat(&out).contains(&flat("账号:")));
+
+        app.control
+            .on_login_event(LoginEvent::LoggedIn("小明 (uid 7)".into()));
+        let out = render(&app, &cfg, 120, 48);
+        assert!(flat(&out).contains(&flat("小明 (uid 7)")));
+        assert!(
+            !out.contains('▀') && !out.contains('▄'),
+            "登录成功后二维码该收掉：\n{out}"
+        );
+    }
 }
+
 

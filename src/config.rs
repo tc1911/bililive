@@ -56,17 +56,16 @@ impl Default for Config {
 impl Config {
     /// 读配置；文件不存在就写一份默认的再读回来。
     pub fn load_or_create(path: Option<&std::path::Path>) -> Result<Self> {
-        let path = match path {
-            Some(p) => p.to_path_buf(),
-            None => Self::path()?,
-        };
+        let path = Self::resolve_path(path)?;
         if !path.exists() {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("建配置目录失败: {}", dir.display()))?;
             }
             let cfg = Config::default();
-            cfg.save()?;
+            // 写的是**解析出来的那个**路径：`-c /tmp/x.toml` 指到别处时，
+            // 以前会往默认路径写一份、然后当作「已经建好了」返回，那个文件根本不存在。
+            cfg.save_to(&path)?;
             return Ok(cfg);
         }
 
@@ -75,13 +74,25 @@ impl Config {
         toml::from_str(&raw).with_context(|| format!("配置解析失败: {}", path.display()))
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
+    /// 存到指定路径。
+    ///
+    /// **这是唯一的写入口**：以前还有一个写死默认路径的 `save()`，而 `-c` 给过别的
+    /// 路径时那份配置根本不在那儿 —— 扫码登录成功要落盘，写错地方就变成
+    /// 「这次登录下次启动就没了」。删掉它就是为了别再有人顺手用回去。
+    pub fn save_to(&self, path: &std::path::Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let text = toml::to_string_pretty(self)?;
-        std::fs::write(&path, text).with_context(|| format!("写配置失败: {}", path.display()))
+        std::fs::write(path, text).with_context(|| format!("写配置失败: {}", path.display()))
+    }
+
+    /// 这次运行到底该读/写哪个文件：显式给的（`-c`）优先，否则默认路径。
+    pub fn resolve_path(explicit: Option<&std::path::Path>) -> Result<PathBuf> {
+        match explicit {
+            Some(p) => Ok(p.to_path_buf()),
+            None => Self::path(),
+        }
     }
 
     pub fn path() -> Result<PathBuf> {

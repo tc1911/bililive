@@ -2,6 +2,7 @@
 
 pub mod client;
 pub mod danmaku;
+pub mod login;
 pub mod room;
 pub mod send;
 pub mod wbi;
